@@ -33,6 +33,26 @@ struct WorkerOptions {
     RefPtr<SerializedScriptValue> workerDataAndEnvironmentData;
     // Objects transferred for either data or environmentData in the transferList
     Vector<TransferredMessagePort> dataMessagePorts;
+    // The worker's ends of the channels that the `Worker` object of node:worker_threads makes for it.
+    // The first three are indexed by fd; Stdin has no pipe unless the worker was given { stdin: true }.
+    enum NodePort : uint8_t {
+        Stdin,
+        Stdout,
+        Stderr,
+        // postMessageToThread: the port to the main thread's hub
+        Hub,
+        // parentPort
+        Parent,
+        NodePortCount,
+    };
+    // Kind::Node only, and not for a Worker that the global constructor made with three arguments.
+    // In transit until the worker's start sequence entangles them (NodeWorkerState::takeFromParent).
+    std::optional<std::array<TransferredMessagePort, NodePortCount>> nodePorts;
+    // workerData carries FileHandle markers. Only node:worker_threads can turn them back into
+    // FileHandles, so the worker loads it before its entry point.
+    bool workerDataHasJSTransferables { false };
+    // Kind::Node: the worker's process.env will have NODE_CHANNEL_FD (JSVMClientData).
+    bool envNamesIPCChannel { false };
     Vector<String> preloadModules;
     std::optional<HashMap<String, String>> env;
     Vector<String> argv;

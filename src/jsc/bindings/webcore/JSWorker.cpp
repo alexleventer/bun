@@ -53,6 +53,7 @@
 #include "JSDOMURL.h"
 #include "JSDOMWrapperCache.h"
 #include "JSEventListener.h"
+#include "JSMessagePort.h"
 #include "NodeValidator.h"
 #include "StructuredSerializeOptions.h"
 #include "WorkerOptions.h"
@@ -167,10 +168,15 @@ template<> __attribute__((minsize)) JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES
     // Founding an env tree swaps the parent's process.env, so it is deferred until
     // every option has validated (below).
     bool shareEnv = false;
+    // node:worker_threads' Worker passes itself (for process 'worker') and then an array: the worker's
+    // ends of the channels it made, in WorkerOptions::NodePort order, and whether workerData carries
+    // FileHandle markers.
     JSValue nodeWorkerObject {};
-    if (callFrame->argumentCount() == 3) {
+    JSArray* nodeChannels = nullptr;
+    if (size_t argumentCount = callFrame->argumentCount(); argumentCount == 3 || argumentCount == 4) {
         nodeWorkerObject = callFrame->argument(2);
         options.kind = WorkerOptions::Kind::Node;
+        nodeChannels = dynamicDowncast<JSArray>(callFrame->argument(3));
     }
     JSValue workerData = jsUndefined();
     Vector<JSC::Strong<JSC::JSObject>> transferList;
@@ -356,14 +362,29 @@ template<> __attribute__((minsize)) JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES
         RETURN_IF_EXCEPTION(throwScope, {});
     }
 
+    // A variable the loader never takes from the process environment: a worker's process.env has it
+    // only from the object it is copied from, or shares.
+    if (options.kind == WorkerOptions::Kind::Node) {
+        if (options.env) {
+            options.envNamesIPCChannel = !options.env->get("NODE_CHANNEL_FD"_s).isEmpty();
+        } else if (shareEnv) {
+            JSObject* env = globalObject->processEnvObject();
+            RETURN_IF_EXCEPTION(throwScope, {});
+            JSValue channel = env->get(lexicalGlobalObject, Identifier::fromString(vm, "NODE_CHANNEL_FD"_s));
+            RETURN_IF_EXCEPTION(throwScope, {});
+            options.envNamesIPCChannel = channel.toBoolean(lexicalGlobalObject);
+        }
+    }
+
     // A worker made by script of a Bun.ModuleGraph that was already disposed is terminated at birth
     // and reports nothing (Worker::create), so nothing is sent to it. The ports node:worker_threads
-    // made for it in that context (in the transfer list, and inside workerData) were closed at
-    // birth the same way: serializing them would throw from the constructor, into a loop that may
+    // made for it in that context (its channel ends, and any in the transfer list) were closed at
+    // birth the same way: transferring them would throw from the constructor, into a loop that may
     // be retrying without ever yielding.
     if (context->isStopped()) {
         transferList.clear();
         workerData = jsUndefined();
+        nodeChannels = nullptr;
     }
 
     Vector<RefPtr<MessagePort>> ports;
@@ -399,6 +420,28 @@ template<> __attribute__((minsize)) JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES
 
     options.workerDataAndEnvironmentData = serialized.releaseReturnValue();
     options.dataMessagePorts = WTF::move(transferredPorts);
+
+    if (nodeChannels) {
+        std::array<TransferredMessagePort, WorkerOptions::NodePortCount> nodePorts;
+        for (unsigned i = 0; i < WorkerOptions::NodePortCount; i++) {
+            JSValue channel = nodeChannels->getIndex(lexicalGlobalObject, i);
+            RETURN_IF_EXCEPTION(throwScope, {});
+            auto* port = dynamicDowncast<JSMessagePort>(channel);
+            if (!port && i == WorkerOptions::Stdin)
+                continue;
+            if (!port || port->wrapped().isDetached() || port->wrapped().isClosing()) {
+                WebCore::propagateException(*lexicalGlobalObject, throwScope, Exception { DataCloneError });
+                RELEASE_AND_RETURN(throwScope, {});
+            }
+            auto transferred = port->wrapped().disentangle();
+            nodePorts[i].pipe = WTF::move(transferred.pipe);
+            nodePorts[i].side = transferred.side;
+        }
+        JSValue hasJSTransferables = nodeChannels->getIndex(lexicalGlobalObject, WorkerOptions::NodePortCount);
+        RETURN_IF_EXCEPTION(throwScope, {});
+        options.workerDataHasJSTransferables = hasJSTransferables.toBoolean(lexicalGlobalObject);
+        options.nodePorts.emplace(WTF::move(nodePorts));
+    }
 
     auto object = Worker::create(*context, WTF::move(scriptUrl), WTF::move(options));
     if constexpr (IsExceptionOr<decltype(object)>)

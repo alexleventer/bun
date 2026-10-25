@@ -1,6 +1,9 @@
 // Port-backed stdio streams shared by both ends of a node:worker_threads Worker:
 // worker.stdout/stderr/stdin on the parent, process.stdout/stderr/stdin in the
-// worker (built lazily from BunProcess.cpp via ProcessObjectInternals).
+// worker (built on first use from NodeWorkerState.cpp via ProcessObjectInternals).
+// The worker's are built after user code has run, so the option objects here have
+// no prototype: the stream constructors must not read what user code put on
+// Object.prototype.
 //
 // Each stream rides its own MessageChannel with node's flow control
 // (lib/internal/worker/io.js): the writer posts an array of chunks and withholds
@@ -34,6 +37,7 @@ function makePortReadable(port: MessagePort, incrementsPortRef: boolean) {
   }
   const Readable = require("internal/streams/readable");
   const stream: PortReadable = new Readable({
+    __proto__: null,
     read() {
       if (startedReading === false && incrementsPortRef) {
         startedReading = true;
@@ -90,6 +94,7 @@ function makePortWritable(port: MessagePort) {
   port.addEventListener("message", onAck);
   port.unref();
   const stream = new Writable({
+    __proto__: null,
     decodeStrings: false,
     writev(chunks, cb) {
       const payload = new Array(chunks.length);
@@ -138,6 +143,7 @@ function makePortWritable(port: MessagePort) {
 function makeEndedReadable() {
   const Readable = require("internal/streams/readable");
   return new Readable({
+    __proto__: null,
     read() {
       this.push(null);
     },

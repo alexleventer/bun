@@ -73,7 +73,7 @@ pub struct WebWorker {
     mini: bool,
     eval_mode: bool,
     /// Created by `node:worker_threads`' `Worker` (as opposed to the Web `Worker`
-    /// constructor): loads `node:worker_threads` before preloads and the entry point.
+    /// constructor): takes what that `Worker` sent before preloads and the entry point.
     is_node_worker: bool,
     /// Borrowed from the proxy's `WorkerOptions` (alive as long as the proxy).
     argv_ptr: *const WTFStringImpl,
@@ -163,9 +163,10 @@ unsafe extern "C" {
     );
     safe fn WebWorker__parentContextWillDestroy(proxy: *mut c_void);
     safe fn WebWorker__entrySettled(global: &JSGlobalObject);
-    /// Loads `node:worker_threads` in this VM (it rebinds process stdio and
-    /// registers parentPort). May leave an exception pending.
-    safe fn Bun__Worker__loadNodeWorkerThreadsModule(global: &JSGlobalObject);
+    /// Takes what the parent's `node:worker_threads` `Worker` sent to this VM
+    /// (workerData, the stdio / parentPort / postMessageToThread ports). Runs
+    /// no builtin module. May leave an exception pending.
+    safe fn Bun__Worker__startNodeWorker(global: &JSGlobalObject);
     safe fn WebWorker__dispatchError(
         global: &JSGlobalObject,
         proxy: *mut c_void,
@@ -846,11 +847,12 @@ impl WebWorker {
         }
 
         // Node runs its worker bootstrap (parentPort, stdio, process overrides)
-        // ahead of user code; ours is node:worker_threads' module body.
+        // ahead of user code. Ours is native and evaluates no builtin module:
+        // what needs one is built when the worker first uses it.
         if self.is_node_worker {
             let global = vm.global();
             if let Err(err) = jsc::host_fn::from_js_host_call_generic(global, || {
-                Bun__Worker__loadNodeWorkerThreadsModule(global)
+                Bun__Worker__startNodeWorker(global)
             }) {
                 let exception = global.take_exception(err);
                 let _ = vm.as_mut().uncaught_exception(global, exception, false);

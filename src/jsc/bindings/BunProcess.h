@@ -45,6 +45,10 @@ public:
     {
     }
 
+    // A worker of node:worker_threads' Worker: the 'exit' listeners of its process.stdout and
+    // process.stderr (BunProcess.cpp). No-op when they are installed already.
+    void installNodeWorkerStdioFlushListeners(JSC::VM&);
+
     DECLARE_EXPORT_INFO;
     bool m_reportOnUncaughtException = false;
 
@@ -67,6 +71,7 @@ public:
     // Environment's own JS, so every worker warns once itself.
     bool m_warnedProcessBinding = false;
     bool m_warnedErrname = false;
+    bool m_hasNodeWorkerStdioFlushListeners = false;
 
     static constexpr unsigned StructureFlags = Base::StructureFlags | HasStaticPropertyTable;
 

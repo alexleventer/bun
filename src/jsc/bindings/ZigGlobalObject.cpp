@@ -172,6 +172,7 @@
 #include "napi.h"
 #include "NodeHTTP.h"
 #include "NodeVM.h"
+#include "NodeWorkerState.h"
 #include "Performance.h"
 #include "ProcessBindingConstants.h"
 #include "ProcessBindingTTYWrap.h"
@@ -1203,6 +1204,9 @@ GlobalObject::GlobalObject(JSC::VM& vm, JSC::Structure* structure, WebCore::Scri
     // m_scriptExecutionContext = globalEventScope.m_context;
     mockModule = Bun::JSMockModule::create(this);
     globalEventScope->m_context = m_scriptExecutionContext;
+    // A worker's default global is the one made with its context id.
+    if (static_cast<JSVMClientData*>(vm.clientData)->isNodeWorkerVM())
+        m_nodeWorkerState = makeUnique<Bun::NodeWorkerState>();
 }
 
 GlobalObject::~GlobalObject()
@@ -2945,12 +2949,22 @@ JSValue GlobalObject_getGlobalThis(VM& vm, JSObject* globalObject)
     return uncheckedDowncast<Zig::GlobalObject>(globalObject)->globalThis();
 }
 
+// Bun's additions to the console object that JSGlobalObject makes.
+static void addConsoleExtensions(VM& vm, Zig::GlobalObject* globalObject, JSObject* consoleObject)
+{
+    auto* clientData = WebCore::clientData(vm);
+    consoleObject->putDirectBuiltinFunction(vm, globalObject, vm.propertyNames->asyncIteratorSymbol, consoleObjectAsyncIteratorCodeGenerator(vm), PropertyAttribute::Builtin | 0);
+    consoleObject->putDirectBuiltinFunction(vm, globalObject, clientData->builtinNames().writePublicName(), consoleObjectWriteCodeGenerator(vm), PropertyAttribute::Builtin | 0);
+    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "Console"_s), CustomGetterSetter::create(vm, getConsoleConstructor, nullptr), PropertyAttribute::CustomValue | 0);
+    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stdout"_s), CustomGetterSetter::create(vm, getConsoleStdout, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
+    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stderr"_s), CustomGetterSetter::create(vm, getConsoleStderr, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
+}
+
 void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
 {
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
     m_builtinInternalFunctions->initialize(*this);
 
-    auto clientData = WebCore::clientData(vm);
     auto& builtinNames = WebCore::builtinNames(vm);
 
     // ----- Private/Static Properties -----
@@ -3075,14 +3089,22 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     errorConstructor->putDirectNativeFunction(vm, this, JSC::Identifier::fromString(vm, "appendStackTrace"_s), 2, errorConstructorFuncAppendStackTrace, ImplementationVisibility::Private, JSC::NoIntrinsic, PropertyAttribute::DontEnum | 0);
     errorConstructor->putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "prepareStackTrace"_s), JSC::CustomGetterSetter::create(vm, errorConstructorPrepareStackTraceGetter, errorConstructorPrepareStackTraceSetter), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue);
 
-    JSC::JSObject* consoleObject = this->get(this, JSC::Identifier::fromString(vm, "console"_s)).getObject();
-    scope.assertNoExceptionExceptTermination();
-    RETURN_IF_EXCEPTION(scope, );
-    consoleObject->putDirectBuiltinFunction(vm, this, vm.propertyNames->asyncIteratorSymbol, consoleObjectAsyncIteratorCodeGenerator(vm), PropertyAttribute::Builtin | 0);
-    consoleObject->putDirectBuiltinFunction(vm, this, clientData->builtinNames().writePublicName(), consoleObjectWriteCodeGenerator(vm), PropertyAttribute::Builtin | 0);
-    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "Console"_s), CustomGetterSetter::create(vm, getConsoleConstructor, nullptr), PropertyAttribute::CustomValue | 0);
-    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stdout"_s), CustomGetterSetter::create(vm, getConsoleStdout, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
-    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stderr"_s), CustomGetterSetter::create(vm, getConsoleStderr, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
+    auto consoleName = JSC::Identifier::fromString(vm, "console"_s);
+    if (m_nodeWorkerState) {
+        // A worker of node:worker_threads: the property becomes a Console over the parent's ports on
+        // its first read (NodeWorkerState). JSGlobalObject's lazy entry makes the console it is
+        // born with here, without reifying the property the slot takes the place of.
+        const HashTableValue* entry = JSGlobalObject::info()->staticPropHashTable->entry(consoleName);
+        RELEASE_ASSERT(entry && (entry->attributes() & PropertyAttribute::PropertyCallback));
+        JSC::JSObject* consoleObject = asObject(entry->lazyPropertyCallback()(vm, this));
+        addConsoleExtensions(vm, this, consoleObject);
+        m_nodeWorkerState->installConsoleSlot(vm, *this, consoleName, consoleObject);
+    } else {
+        JSC::JSObject* consoleObject = this->get(this, consoleName).getObject();
+        scope.assertNoExceptionExceptTermination();
+        RETURN_IF_EXCEPTION(scope, );
+        addConsoleExtensions(vm, this, consoleObject);
+    }
 }
 
 // ===================== start conditional builtin globals =====================
@@ -4559,28 +4581,8 @@ void GlobalObject::adoptNapiEnvsForTestIsolation(GlobalObject* oldGlobal)
 }
 
 void GlobalObject::setNodeWorkerEnvironmentData(JSMap* data) { m_nodeWorkerEnvironmentData.set(vm(), this, data); }
-void GlobalObject::setNodeWorkerStdioPorts(JSObject* ports) { m_nodeWorkerStdioPorts.set(vm(), this, ports); }
-void GlobalObject::setNodeWorkerEntryEvaluatedHook(JSObject* hook)
-{
-    if (hook)
-        m_nodeWorkerEntryEvaluatedHook.set(vm(), this, hook);
-    else
-        m_nodeWorkerEntryEvaluatedHook.clear();
-}
 
 extern "C" void Bun__InspectorConnection__disconnectAllOnExit(Zig::GlobalObject*);
-
-void GlobalObject::setNodeParentPort(WebCore::MessagePort* port)
-{
-    m_nodeParentPort = port;
-}
-
-void GlobalObject::nodeWorkerEntryDidSettle()
-{
-    m_nodeWorkerEntrySettled = true;
-    if (m_nodeParentPort)
-        m_nodeParentPort->entrySettled();
-}
 
 void GlobalObject::prepareForDestruction()
 {

@@ -3,14 +3,16 @@
 // control MessagePort to it, and it routes each message to the destination's port.
 // Delivery results are reported back through a SharedArrayBuffer + Atomics.
 //
-// Differences from node: thread info comes from initThreadInfo (Bun assigns threadId
-// differently); createMainThreadPort is split into createMessagingChannel (before
-// `new Worker`) + registerMainThreadPort (after the threadId exists); and the
-// `workerMessage` listeners are invoked directly because Bun's process.emit cannot
-// report no-listeners or a throwing listener (see receiveMessageFromWorker).
-
-const { validateNumber } = require("internal/validators");
-const { SafeMap } = require("internal/primordials");
+// Differences from node: thread info and this thread's port to the hub come from the native
+// binding (Bun assigns threadId differently, and a worker's port is taken by its native start
+// sequence); createMainThreadPort is split into createMessagingChannel (before `new Worker`) +
+// registerMainThreadPort (after the threadId exists); and the `workerMessage` listeners are invoked
+// directly because Bun's process.emit cannot report no-listeners or a throwing listener (see
+// receiveMessageFromWorker).
+//
+// A worker does not evaluate this module until it sends, or until the first message for it
+// arrives: the native listener on its port (NodeWorkerState.cpp) requires this module then and
+// hands that message to the listener attached below.
 
 const messageTypes = {
   REGISTER_MAIN_THREAD_PORT: "registerMainThreadPort",
@@ -19,20 +21,30 @@ const messageTypes = {
   RECEIVE_MESSAGE_FROM_WORKER: "receiveMessageFromWorker",
 };
 
-// Set once via initThreadInfo() when worker_threads.ts loads.
-let currentThreadId = 0;
-let isMainThread = true;
-// The intrinsic constructor from worker_threads' native binding, not
-// globalThis.MessageChannel, which user code can replace (#40268).
-let MessageChannel: typeof globalThis.MessageChannel;
+const {
+  0: currentThreadId,
+  1: isMainThread,
+  // The intrinsic constructor, not globalThis.MessageChannel, which user code can replace (#40268).
+  2: MessageChannel,
+  // Only in a worker that node:worker_threads' Worker made; undefined on the main thread and in a
+  // raw Web Worker, which is not connected to the hub.
+  3: mainThreadPort,
+} = $cpp("Worker.cpp", "createNodeWorkerMessagingBinding") as [
+  number,
+  boolean,
+  typeof globalThis.MessageChannel,
+  import("node:worker_threads").MessagePort | undefined,
+];
 
-// Only populated on the main thread (the hub); always empty elsewhere.
+// Only the main thread (the hub) has these.
 // SafeMap: its prototype is a frozen null-proto snapshot taken at bootstrap, so the
 // cross-thread routing table can't be broken by user code replacing Map.prototype.
-const threadsPorts: Map<number, import("node:worker_threads").MessagePort> = new SafeMap();
-
-// Only populated on child threads; always undefined on the main thread.
-let mainThreadPort: any;
+const SafeMap = isMainThread ? require("internal/primordials").SafeMap : undefined;
+const threadsPorts: Map<number, import("node:worker_threads").MessagePort> = isMainThread ? new SafeMap() : undefined;
+// What the hub routed to a thread and has seen no reply to, by destination. A thread can exit
+// with such a message still in its port, or on its way there, and then nothing on that thread
+// answers it: the hub does, when it sees the thread's port close (failUnanswered).
+const unansweredByThread: Map<number, SharedArrayBuffer[]> = isMainThread ? new SafeMap() : undefined;
 
 // SharedArrayBuffer must always be Int32, so it's * 4.
 // One slot for the operation status (performing / performed) and one for the result.
@@ -44,12 +56,6 @@ const WORKER_MESSAGING_RESULT_INDEX = 1;
 const WORKER_MESSAGING_RESULT_DELIVERED = 0;
 const WORKER_MESSAGING_RESULT_NO_LISTENERS = 1;
 const WORKER_MESSAGING_RESULT_LISTENER_ERROR = 2;
-
-function initThreadInfo(threadId: number, mainThread: boolean, MessageChannelCtor: typeof globalThis.MessageChannel) {
-  currentThreadId = threadId;
-  isMainThread = mainThread;
-  MessageChannel = MessageChannelCtor;
-}
 
 // This event handler is always executed on the main thread only.
 function handleMessageFromThread(message) {
@@ -69,6 +75,7 @@ function handleMessageFromThread(message) {
       // never ran); otherwise the stale entry lingers in the hub forever.
       port.on("close", () => {
         if (threadsPorts.get(threadId) === port) threadsPorts.delete(threadId);
+        failUnanswered(threadId);
       });
 
       // Never block the thread on this port.
@@ -81,6 +88,7 @@ function handleMessageFromThread(message) {
         port.close();
         threadsPorts.delete(message.threadId);
       }
+      failUnanswered(message.threadId);
       break;
     }
     case messageTypes.SEND_MESSAGE_TO_WORKER: {
@@ -88,6 +96,20 @@ function handleMessageFromThread(message) {
       sendMessageToWorker(source, destination, value, transferList, memory);
       break;
     }
+  }
+}
+
+// The thread is gone: it has no `workerMessage` listeners any more.
+function failUnanswered(threadId: number) {
+  const unanswered = unansweredByThread.get(threadId);
+  if (!unanswered) return;
+  unansweredByThread.delete(threadId);
+  for (let i = 0; i < unanswered.length; i++) {
+    const status = new Int32Array(unanswered[i]);
+    if (Atomics.load(status, WORKER_MESSAGING_STATUS_INDEX) !== 0) continue;
+    Atomics.store(status, WORKER_MESSAGING_RESULT_INDEX, WORKER_MESSAGING_RESULT_NO_LISTENERS);
+    Atomics.store(status, WORKER_MESSAGING_STATUS_INDEX, 1);
+    Atomics.notify(status, WORKER_MESSAGING_STATUS_INDEX, 1);
   }
 }
 
@@ -127,6 +149,19 @@ function sendMessageToWorker(source, destination, value, transferList, memory) {
     },
     transferList,
   );
+
+  let unanswered = unansweredByThread.get(destination);
+  if (!unanswered) {
+    unansweredByThread.set(destination, (unanswered = []));
+  } else if (unanswered.length >= 64) {
+    // Most have a reply by now. Keep the rest.
+    let kept = 0;
+    for (let i = 0; i < unanswered.length; i++) {
+      if (Atomics.load(new Int32Array(unanswered[i]), WORKER_MESSAGING_STATUS_INDEX) === 0) unanswered[kept++] = unanswered[i];
+    }
+    unanswered.length = kept;
+  }
+  $arrayPush(unanswered, memory);
 }
 
 function receiveMessageFromWorker(source, value, memory) {
@@ -200,36 +235,14 @@ function destroyMainThreadPort(threadId: number) {
   }
 }
 
-// Deliveries from the main-thread hub are deferred until the entry module has
-// finished evaluating (the native side invokes the entryEvaluated hook right
-// before dispatching 'online'), matching node's bootstrap -> synchronous CJS
-// main ordering: a routed message must not observe "no listeners" while the
-// entry that registers them is still loading.
-let entryEvaluated = false;
-let pendingMainPortMessages: any[] | null = null;
-
-function handleMessageFromMainThreadGated(message) {
-  if (!entryEvaluated) {
-    (pendingMainPortMessages ??= []).push(message);
-    return;
-  }
-  handleMessageFromMainThread(message);
-}
-
-function setupMainThreadPort(port: any, setEntryEvaluatedHook: (hook: () => void) => void) {
-  mainThreadPort = port;
-  mainThreadPort.on("message", handleMessageFromMainThreadGated);
-
-  // Stored on ZigGlobalObject (WriteBarrier), not on globalThis, so user code
-  // can't observe or clobber it. WebWorker__entrySettled calls it once.
-  setEntryEvaluatedHook(() => {
-    entryEvaluated = true;
-    const pending = pendingMainPortMessages;
-    pendingMainPortMessages = null;
-    // Indexed, not for-of: Array.prototype[Symbol.iterator] is user-overridable.
-    if (pending) for (let i = 0; i < pending.length; i++) handleMessageFromMainThread(pending[i]);
-  });
-
+// Deliveries from the main-thread hub wait until the entry module has finished evaluating,
+// matching node's bootstrap -> synchronous CJS main ordering: a routed message must not observe
+// "no listeners" while the entry that registers them is still loading. The port does that
+// natively (MessagePort::holdStartUntilEntrySettled), so what arrives here is handled at once.
+if (mainThreadPort) {
+  // addEventListener, not on(): the emitter methods belong to node:worker_threads, which this
+  // thread may never load.
+  mainThreadPort.addEventListener("message", event => handleMessageFromMainThread(event.data));
   // Never block the process on this port.
   mainThreadPort.unref();
 }
@@ -245,7 +258,7 @@ async function postMessageToThread(threadId, value, transferList, timeout) {
   }
 
   if (typeof timeout !== "undefined") {
-    validateNumber(timeout, "timeout", 0);
+    require("internal/validators").validateNumber(timeout, "timeout", 0);
   }
 
   if (threadId === currentThreadId) {
@@ -292,10 +305,8 @@ async function postMessageToThread(threadId, value, transferList, timeout) {
 }
 
 export default {
-  initThreadInfo,
   createMessagingChannel,
   registerMainThreadPort,
   destroyMainThreadPort,
-  setupMainThreadPort,
   postMessageToThread,
 };

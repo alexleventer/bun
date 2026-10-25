@@ -145,6 +145,7 @@ ExceptionOr<void> MessagePort::postMessage(JSC::JSGlobalObject& state, JSC::JSVa
 
 void MessagePort::entrySettled()
 {
+    m_holdsStartUntilEntrySettled = false;
     if (!std::exchange(m_startDeferredUntilEntrySettled, false))
         return;
     start();
@@ -154,16 +155,9 @@ void MessagePort::start()
 {
     if (m_started || !isEntangled())
         return;
-    // A node worker's parentPort delivers nothing until the entry module has evaluated; keep the
-    // request and let entrySettled() perform it. Messages stay buffered in the pipe meanwhile.
-    if (auto* context = scriptExecutionContext()) {
-        if (auto* jsGlobal = context->globalObject()) {
-            auto* globalObject = defaultGlobalObject(jsGlobal);
-            if (globalObject->nodeParentPort() == this && !globalObject->nodeWorkerEntrySettled()) {
-                m_startDeferredUntilEntrySettled = true;
-                return;
-            }
-        }
+    if (m_holdsStartUntilEntrySettled) {
+        m_startDeferredUntilEntrySettled = true;
+        return;
     }
     m_started = true;
 
@@ -174,7 +168,7 @@ void MessagePort::start()
     m_pipe->attach(m_side, *context, ThreadSafeWeakPtr<MessagePort> { *this });
 }
 
-void MessagePort::flushQueuedMessagesBeforeClose()
+void MessagePort::deliverQueuedMessages()
 {
     auto* context = scriptExecutionContext();
     if (!context || !context->globalObject())
@@ -214,7 +208,7 @@ void MessagePort::close()
     // close() runs outside a dispatch. Reentrant close() is short-circuited by
     // m_isClosing; later sends are rejected by the pipe's Closed check.
     if (m_isDispatching)
-        flushQueuedMessagesBeforeClose();
+        deliverQueuedMessages();
 
     m_isDetached = true;
 
@@ -279,7 +273,7 @@ void MessagePort::peerClosed()
     // them that way, and registerCloseContext()'s retroactive notify can land before any
     // drain is scheduled -- e.g. on('close') registered before on('message').
     if (m_started && hasMessageEventListener())
-        flushQueuedMessagesBeforeClose();
+        deliverQueuedMessages();
     // Fire 'close' (guarded against a double dispatch) and release this side's loop refs
     // so the loop can idle, matching node.
     dispatchCloseEvent();

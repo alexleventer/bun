@@ -70,8 +70,16 @@ public:
 
     void start();
     bool hasMessageEventListener() const { return m_hasMessageEventListener; }
-    // The worker's entry module finished evaluating: a start() requested before that takes effect now.
+    // A node:worker_threads worker's parentPort and its port to the postMessageToThread hub deliver
+    // nothing until the entry module has evaluated (node's ordering; a message must not run, or
+    // throw, while the entry that handles it is loading). A start() requested before that is kept
+    // and performed by entrySettled(). Messages stay buffered in the pipe meanwhile.
+    void holdStartUntilEntrySettled() { m_holdsStartUntilEntrySettled = true; }
     void entrySettled();
+    // Dispatch what is queued now, on the caller's stack instead of from a drain task: close()
+    // inside a handler and a peer's close do it before teardown, and a worker's hub port when its
+    // entry settles.
+    void deliverQueuedMessages();
     void close();
     // Called on the entangled peer when this side closes: dispatches a
     // 'close' event and releases the event-loop ref so the loop can idle.
@@ -123,9 +131,6 @@ private:
     void stop() final { close(); }
     bool virtualHasPendingActivity() const final;
 
-    // Deliver messages already queued when close() is called, before teardown.
-    void flushQueuedMessagesBeforeClose();
-
     bool isEntangled() const { return !m_isDetached; }
 
 public:
@@ -149,6 +154,7 @@ private:
     bool m_isDispatching { false };
     bool m_closeEventDispatched { false };
     bool m_hasMessageEventListener { false };
+    bool m_holdsStartUntilEntrySettled { false };
     bool m_startDeferredUntilEntrySettled { false };
     // Read from the GC thread: a port whose only listener is 'close' must survive
     // until that event is delivered, or the peer's close is lost to a collection.

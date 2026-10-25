@@ -40,6 +40,10 @@ public:
     static JSC::JSObject* createPrototype(JSC::VM&, JSDOMGlobalObject&);
     static JSC::JSObject* prototype(JSC::VM&, JSDOMGlobalObject&);
     static MessagePort* toWrapped(JSC::VM&, JSC::JSValue);
+    // node:worker_threads is being evaluated in one of its workers and defines the members that the
+    // prototype has stood in for with slots (JSMessagePort.cpp). The slots go away. Returns the object
+    // that the emitter methods belong on, or null where the prototype never had slots.
+    static JSC::JSObject* retireNodeWorkerMemberSlots(JSC::VM&, Zig::GlobalObject&);
 
     DECLARE_INFO;
 
