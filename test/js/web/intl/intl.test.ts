@@ -9,6 +9,7 @@
 // When WEBKIT_VERSION bumps ICU/CLDR, regenerate with `-u` against a build that
 // links the unmodified libicudata.a.
 
+import { CString, dlopen, ptr } from "bun:ffi";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isLinux, isMacOS, isWindows, libcPathForDlopen } from "harness";
 import { join } from "node:path";
@@ -108,15 +109,28 @@ describe("Intl.DateTimeFormat", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Time zone names with no '/' — zones of their own or links, by the tz data
+// Time zone names with no '/' — aliases of city zones, with every tz data
 // ---------------------------------------------------------------------------
 
 // The tz database has EST5EDT, CST6CDT, MST7MDT and PST8PDT as zones of their own before 2024b and from 2026d on, and
-// CET, EET, MET and WET before 2024b. In the other releases each is a link to a city zone. ICU holds a zone of its own
-// canonical. JavaScriptCore once had no zone for a canonical name with no '/': as the zone of the process the name gave
-// UTC, and as a time zone ID it was a RangeError.
+// CET, EET, MET and WET before 2024b. ICU then holds the name canonical, and JavaScriptCore had no zone for it: as the
+// zone of the process the name gave UTC, and as a time zone ID it was a RangeError. In the other tz releases each name
+// is a link to a city zone. An alias of that city zone is what each is here, with every tz data (tc39/ecma402#1103).
 describe.concurrent("time zone names with no '/'", () => {
-  // getTimezoneOffset() for 09:00 local time on 15 January and on 15 July 2026, and the zone that Intl reports.
+  // getTimezoneOffset() for 09:00 local time on 15 January and on 15 July 2026, the city zone, and the name of its
+  // standard time.
+  const legacy: [name: string, january: number, july: number, city: string, standardTime: string][] = [
+    ["EST5EDT", 300, 240, "America/New_York", "Eastern Standard Time"],
+    ["CST6CDT", 360, 300, "America/Chicago", "Central Standard Time"],
+    ["MST7MDT", 420, 360, "America/Denver", "Mountain Standard Time"],
+    ["PST8PDT", 480, 420, "America/Los_Angeles", "Pacific Standard Time"],
+    ["CET", -60, -120, "Europe/Brussels", "Central European Standard Time"],
+    ["EET", -120, -180, "Europe/Athens", "Eastern European Standard Time"],
+    ["MET", -60, -120, "Europe/Brussels", "Central European Standard Time"],
+    ["WET", 0, -60, "Europe/Lisbon", "Western European Standard Time"],
+  ];
+
+  // probe() is what each way to name a zone gives for one of the names.
   const prelude = `
     import { setTimeZone } from "bun:jsc";
     const zone = () => [
@@ -125,7 +139,26 @@ describe.concurrent("time zone names with no '/'", () => {
       Intl.DateTimeFormat().resolvedOptions().timeZone,
     ];
     const attempt = fn => { try { return fn(); } catch (error) { return String(error); } };
-    const listed = Intl.supportedValuesOf("timeZone").filter(name => !name.includes("/"));`;
+    const january = new Date(Date.UTC(2026, 0, 15));
+    const probe = ([name, , , city]) => ({
+      assigned: (process.env.TZ = "Asia/Tokyo", process.env.TZ = name, zone()),
+      option: attempt(() => new Intl.DateTimeFormat("en-US", { timeZone: name.toLowerCase() }).resolvedOptions().timeZone),
+      standardTime: attempt(() => new Intl.DateTimeFormat("en-US", { timeZone: name, timeZoneName: "long" }).formatToParts(january).find(part => part.type === "timeZoneName").value),
+      temporal: attempt(() => new Temporal.ZonedDateTime(0n, name).timeZoneId),
+      isCity: attempt(() => new Temporal.ZonedDateTime(0n, name).equals(new Temporal.ZonedDateTime(0n, city))),
+      cron: attempt(() => Bun.cron.parse("0 9 * * *", january, { tz: name }).toISOString()),
+    });
+    const listed = () => Intl.supportedValuesOf("timeZone").filter(name => !name.includes("/"));`;
+  const expected = ([name, january, july, city, standardTime]: (typeof legacy)[number]) => ({
+    assigned: [january, july, city],
+    // An alias keeps its name.
+    option: name,
+    // ICU is asked for the city zone. For a zone of its own it has no name but "GMT-05:00".
+    standardTime,
+    temporal: name,
+    isCity: true,
+    cron: new Date(Date.UTC(2026, 0, 15, 9, january)).toISOString(),
+  });
 
   async function run(env: Record<string, string>, script: string) {
     await using proc = Bun.spawn({
@@ -138,37 +171,54 @@ describe.concurrent("time zone names with no '/'", () => {
     return { result: JSON.parse(stdout || "null"), stderr, exitCode };
   }
 
+  // The version of the tz data of the system ICU of macOS, and the zone IDs with no '/' that it holds canonical.
+  function systemTimeZoneData() {
+    const { symbols } = dlopen("/usr/lib/libicucore.A.dylib", {
+      ucal_getTZDataVersion: { args: ["ptr"], returns: "ptr" },
+      ucal_openTimeZoneIDEnumeration: { args: ["i32", "ptr", "ptr", "ptr"], returns: "ptr" },
+      uenum_next: { args: ["ptr", "ptr", "ptr"], returns: "ptr" },
+      uenum_close: { args: ["ptr"], returns: "void" },
+    });
+    const status = new Int32Array(1);
+    const tz = new CString(symbols.ucal_getTZDataVersion(ptr(status))!).toString();
+    const UCAL_ZONE_TYPE_CANONICAL = 1;
+    const ids = symbols.ucal_openTimeZoneIDEnumeration(UCAL_ZONE_TYPE_CANONICAL, null, null, ptr(status));
+    const canonical: string[] = [];
+    for (let id; ids && (id = symbols.uenum_next(ids, null, ptr(status)));) {
+      const name = new CString(id).toString();
+      if (!name.includes("/")) canonical.push(name);
+    }
+    if (ids) symbols.uenum_close(ids);
+    return { icu: process.versions.icu, tz, canonical };
+  }
+
   // ICU reads the time zone files in ICU_TIMEZONE_FILES_DIR in place of its own. icu-tz-2024a/timezoneTypes.res is
   // tzdata/icunew/2024a/44/le/timezoneTypes.res of unicode-org/icu-data: with it ICU holds the four US names and
   // "Factory" canonical, whatever tz data it was built with. macOS has the ICU of the system, which has its own files.
-  test.skipIf(isMacOS)("a name that ICU holds canonical is a time zone", async () => {
-    const names = ["CST6CDT", "EST5EDT", "MST7MDT", "PST8PDT"];
+  test.skipIf(isMacOS)("a name that ICU holds canonical is an alias of its city zone", async () => {
+    const names = legacy.slice(0, 4);
     const { result, stderr, exitCode } = await run(
       { TZ: "EST5EDT", ICU_TIMEZONE_FILES_DIR: join(import.meta.dir, "icu-tz-2024a") },
       `
-      const names = ${JSON.stringify(names)};
       console.log(JSON.stringify({
-        start: zone(),
-        assigned: (process.env.TZ = "Asia/Tokyo", process.env.TZ = "PST8PDT", zone()),
+        start: [...zone(), new Date(2026, 0, 15, 9).toString()],
+        names: ${JSON.stringify(names)}.map(probe),
+        // setTimeZone() returns the name that ICU holds canonical: this shows that ICU read the file.
         setTimeZone: [attempt(() => setTimeZone("CST6CDT")), ...zone()],
         // With no zone set, the zone is the one of the host.
         host: (delete process.env.TZ, zone()),
-        option: names.map(name => attempt(() => new Intl.DateTimeFormat("en", { timeZone: name.toLowerCase() }).resolvedOptions().timeZone)),
-        temporal: names.map(name => attempt(() => new Temporal.ZonedDateTime(0n, name).timeZoneId)),
-        listed,
+        listed: listed(),
         // The tz database has no "SystemV/" zone, and its "Factory" zone is for a clock that is not set.
-        notZones: ["Factory", "SystemV/EST5EDT"].map(name => attempt(() => new Intl.DateTimeFormat("en", { timeZone: name }).resolvedOptions().timeZone)),
+        notZones: ["Factory", "SystemV/EST5EDT"].map(name => attempt(() => new Intl.DateTimeFormat("en-US", { timeZone: name }).resolvedOptions().timeZone)),
       }));`,
     );
     expect(result).toEqual({
-      start: [300, 240, "EST5EDT"],
-      assigned: [480, 420, "PST8PDT"],
-      setTimeZone: ["CST6CDT", 360, 300, "CST6CDT"],
+      start: [300, 240, "America/New_York", "Thu Jan 15 2026 09:00:00 GMT-0500 (Eastern Standard Time)"],
+      names: names.map(expected),
+      setTimeZone: ["CST6CDT", 360, 300, "America/Chicago"],
       // ICU takes the zone of the host from the TZ of the environment on Linux.
-      host: isLinux ? [300, 240, "EST5EDT"] : result?.host,
-      option: names,
-      temporal: names,
-      listed: [...names, "UTC"],
+      host: isLinux ? [300, 240, "America/New_York"] : result?.host,
+      listed: ["UTC"],
       notZones: ["RangeError: invalid time zone: Factory", "RangeError: invalid time zone: SystemV/EST5EDT"],
     });
     expect(stderr).toBe("");
@@ -177,43 +227,19 @@ describe.concurrent("time zone names with no '/'", () => {
 
   // With the tz data that ICU has on this machine. The system ICU of macOS has the tz data of the machine: on a
   // macOS 15 machine of CI, EST5EDT is a zone of its own.
-  test("each name is a zone of its own or a link to a city zone", async () => {
-    const legacy: [name: string, january: number, july: number, city: string][] = [
-      ["EST5EDT", 300, 240, "America/New_York"],
-      ["CST6CDT", 360, 300, "America/Chicago"],
-      ["MST7MDT", 420, 360, "America/Denver"],
-      ["PST8PDT", 480, 420, "America/Los_Angeles"],
-      ["CET", -60, -120, "Europe/Brussels"],
-      ["EET", -120, -180, "Europe/Athens"],
-      ["MET", -60, -120, "Europe/Brussels"],
-      ["WET", 0, -60, "Europe/Lisbon"],
-    ];
-    const names = legacy.map(([name]) => name);
+  test("each name is an alias of its city zone", async () => {
+    // A run that passes says which tz data it went through.
+    if (isMacOS) console.log("system ICU:", JSON.stringify(systemTimeZoneData()));
     const { result, stderr, exitCode } = await run(
-      { TZ: names[0] },
+      { TZ: "EST5EDT" },
       `
-      const names = ${JSON.stringify(names)};
       console.log(JSON.stringify({
         start: zone(),
-        assigned: names.map(name => (process.env.TZ = name, zone())),
-        option: names.map(name => attempt(() => new Intl.DateTimeFormat("en", { timeZone: name }).resolvedOptions().timeZone)),
-        listed,
+        names: ${JSON.stringify(legacy)}.map(probe),
+        listed: listed(),
       }));`,
     );
-    // Intl.supportedValuesOf("timeZone") has a name that is a zone of its own, and not a name that is a link.
-    const own = names.filter(name => result?.listed.includes(name));
-    const zoneOf = ([name, january, july, city]: (typeof legacy)[number]) => [
-      january,
-      july,
-      own.includes(name) ? name : city,
-    ];
-    expect(result).toEqual({
-      start: zoneOf(legacy[0]),
-      assigned: legacy.map(zoneOf),
-      option: names,
-      // No other name with no '/' is a time zone: ICU has zone IDs that the tz database does not have.
-      listed: [...own, "UTC"].sort(),
-    });
+    expect(result).toEqual({ start: [300, 240, "America/New_York"], names: legacy.map(expected), listed: ["UTC"] });
     expect(stderr).toBe("");
     expect(exitCode).toBe(0);
   });
