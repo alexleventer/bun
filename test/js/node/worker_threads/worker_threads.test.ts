@@ -2385,7 +2385,7 @@ test("MessagePort: peer closing while a port is in transit still delivers 'close
   });
 });
 
-test("workerData is not unwrapped for a non-node globalThis.Worker", async () => {
+test("workerData with a once-reserved key reaches a non-node globalThis.Worker as it is", async () => {
   await using proc = Bun.spawn({
     cmd: [
       bunExe(),
@@ -2401,7 +2401,7 @@ test("workerData is not unwrapped for a non-node globalThis.Worker", async () =>
   });
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   const out = JSON.parse(stdout);
-  // The unwrap block was skipped: workerData is the original object, not `.data`.
+  // No key of workerData is reserved: it is the original object, not its `.data`.
   expect({ workerData: out.workerData, stderr, exitCode }).toEqual({
     workerData: { "@@bunWorkerThreadsMessaging": {}, data: 1 },
     stderr,
