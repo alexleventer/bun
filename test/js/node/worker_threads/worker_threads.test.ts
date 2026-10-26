@@ -3340,3 +3340,353 @@ test("a ShadowRealm in a worker can import node:worker_threads", async () => {
   expect(stdout).toBe("true\n");
   expect(exitCode).toBe(0);
 });
+
+// A worker made by node:worker_threads' Worker starts natively. It takes its channels from the
+// parent and evaluates no builtin module. What needs one is built when the worker first uses it:
+// process.stdout / stderr / stdin, console, the MessagePort emitter methods, postMessageToThread.
+// So each of these is used here in a worker that never loads node:worker_threads.
+describe("node worker start sequence", () => {
+  // Runs `source` in a worker. Resolves with what the worker wrote and its exit code.
+  async function runWorker(source: string, options: import("node:worker_threads").WorkerOptions = {}) {
+    const worker = new Worker(source, { eval: true, stdout: true, stderr: true, ...options });
+    let stdout = "";
+    let stderr = "";
+    worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+    worker.stderr.setEncoding("utf8").on("data", chunk => (stderr += chunk));
+    const [exitCode] = await once(worker, "exit");
+    return { stdout, stderr, exitCode };
+  }
+
+  test("compiles no more functions before the entry point than a Web Worker's does", async () => {
+    // A function that ran has a code block. The count is taken in the first statement of each entry.
+    const count = `const { FunctionCodeBlock } = require("bun:jsc").heapStats().objectTypeCounts;`;
+    using dir = tempDir("worker-start-sequence", {
+      "web.cjs": `${count} postMessage(FunctionCodeBlock);`,
+      "node.cjs": `${count} require("node:worker_threads").parentPort.postMessage(FunctionCodeBlock);`,
+      "main.cjs": `
+        const { Worker: NodeWorker } = require("node:worker_threads");
+        const { once } = require("node:events");
+        (async () => {
+          const web = new Worker(__dirname + "/web.cjs");
+          const counts = { web: (await new Promise(resolve => (web.onmessage = resolve))).data };
+          web.terminate();
+          const shapes = { node: {}, nodeWithOptions: { stdin: true, stdout: true, workerData: ["data"], name: "named" } };
+          for (const shape in shapes) {
+            const worker = new NodeWorker(__dirname + "/node.cjs", shapes[shape]);
+            [counts[shape]] = await once(worker, "message");
+            await once(worker, "exit");
+          }
+          console.log(JSON.stringify(counts));
+        })();
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "main.cjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    const { web, ...node } = JSON.parse(stdout);
+    expect(web).toBeGreaterThan(0);
+    expect(node).toEqual({ node: web, nodeWithOptions: web });
+    expect(exitCode).toBe(0);
+  });
+
+  test("process has node's worker restrictions", async () => {
+    const { stdout, exitCode } = await runWorker(`
+      const code = fn => { try { fn(); } catch (e) { return e.code; } };
+      process.stdout.write(JSON.stringify({
+        chdir: [process.chdir.disabled, code(() => process.chdir(process.cwd()))],
+        abort: process.abort.disabled,
+        umask: [typeof process.umask(), code(() => process.umask(0o22))],
+        debugPort: process.debugPort,
+      }));
+    `);
+    expect(JSON.parse(stdout)).toEqual({
+      chdir: [true, "ERR_WORKER_UNSUPPORTED_OPERATION"],
+      abort: true,
+      umask: ["number", "ERR_WORKER_UNSUPPORTED_OPERATION"],
+      debugPort: 9229,
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  test("console and process.stdout / stderr write to the parent's worker.stdout / stderr", async () => {
+    const result = await runWorker(`
+      const { Console } = require("node:console");
+      console.log("log", typeof Console, console instanceof Console);
+      console.error("error");
+      process.stdout.write("write\\n");
+      process.stderr.write("write\\n");
+    `);
+    expect(result).toEqual({ stdout: "log function true\nwrite\n", stderr: "error\nwrite\n", exitCode: 0 });
+  });
+
+  test("process.stdin is at its end unless the worker has { stdin: true }", async () => {
+    const result = await runWorker(`
+      const chunks = [];
+      process.stdin.on("data", chunk => chunks.push(chunk)).on("end", () => process.stdout.write("end " + chunks.length));
+    `);
+    expect(result).toEqual({ stdout: "end 0", stderr: "", exitCode: 0 });
+  });
+
+  // The streams and the Console are constructed after user code has run.
+  test("Object.prototype does not configure console and the stdio streams", async () => {
+    const pollute = `Object.assign(Object.prototype, { objectMode: true, highWaterMark: 1, colorMode: true, groupIndentation: 7 });`;
+    const use = `
+      const wrote = [process.stdout.write("ab"), process.stdout.write("cd\\n"), process.stderr.write(Buffer.from("ef\\n"))];
+      console.group("group");
+      console.log({ a: [1, "two"] }, wrote);
+      console.groupEnd();
+      console.warn("%s", "warn");
+    `;
+    const build = `void console; void process.stdout; void process.stderr; void process.stdin;`;
+    const builtAfter = await runWorker(pollute + use);
+    expect(builtAfter).toEqual(await runWorker(build + pollute + use));
+    expect(builtAfter.exitCode).toBe(0);
+  });
+
+  test("a read of console or a stdio stream that fails to build it throws, and the next read builds it", async () => {
+    // An EventEmitter reads this._events when it is constructed.
+    const result = await runWorker(`
+      Object.defineProperty(Object.prototype, "_events", { get() { throw new Error("not now"); }, configurable: true });
+      const errors = [() => console, () => process.stdout, () => process.stderr, () => process.stdin].map(read => {
+        try { read(); } catch (e) { return e.message; }
+      });
+      delete Object.prototype._events;
+      console.log(JSON.stringify(errors));
+      process.stderr.write("stderr\\n");
+      process.stdin.on("data", () => {}).on("end", () => process.stdout.write("stdin end\\n"));
+    `);
+    expect(result).toEqual({
+      stdout: '["not now","not now","not now","not now"]\nstdin end\n',
+      stderr: "stderr\n",
+      exitCode: 0,
+    });
+  });
+
+  test("a synchronous exit writes buffered output ahead of an 'exit' listener added before the first write", async () => {
+    const result = await runWorker(`
+      process.on("exit", () => process.stdout.write("exit listener\\n"));
+      for (let i = 0; i < 5; i++) process.stdout.write("line " + i + "\\n");
+      process.exit(3);
+    `);
+    expect(result).toEqual({
+      stdout: "line 0\nline 1\nline 2\nline 3\nline 4\nexit listener\n",
+      stderr: "",
+      exitCode: 3,
+    });
+  });
+
+  test("MessagePort has node's emitter methods, close(callback) and inspect hook", async () => {
+    const shape = `JSON.stringify([MessagePort.prototype, Object.getPrototypeOf(MessagePort.prototype)].map(Object.getOwnPropertyNames))`;
+    const { stdout, exitCode } = await runWorker(`
+      const shape = ${shape};
+      const { port1, port2 } = new MessageChannel();
+      port1.once("message", message => {
+        const emitter = Object.getPrototypeOf(MessagePort.prototype);
+        const on = Object.getOwnPropertyDescriptor(emitter, "on");
+        const report = {
+          message,
+          listeners: [port2.listenerCount("message"), port2.on("message", () => {}).listenerCount("message")],
+          on: [typeof on.value, on.writable, on.enumerable, on.configurable],
+          inspect: typeof port1[Symbol.for("nodejs.util.inspect.custom")],
+          emitter: Object.getOwnPropertyNames(emitter),
+          sameShape: shape === ${shape},
+        };
+        port1.close(() => process.stdout.write(JSON.stringify(report)));
+      });
+      port2.postMessage("hello");
+    `);
+    expect(JSON.parse(stdout)).toEqual({
+      message: "hello",
+      listeners: [0, 1],
+      on: ["function", true, false, true],
+      inspect: "function",
+      emitter: [
+        "on",
+        "off",
+        "once",
+        "emit",
+        "addListener",
+        "removeListener",
+        "listenerCount",
+        "eventNames",
+        "removeAllListeners",
+        "setMaxListeners",
+        "getMaxListeners",
+      ],
+      sameShape: true,
+    });
+    expect(exitCode).toBe(0);
+  });
+
+  describe("postMessageToThread", () => {
+    const { postMessageToThread } = wt;
+
+    test.each([
+      ["never loaded", ""],
+      ["loaded", `require("node:worker_threads");`],
+    ])("delivers each message once to a worker that has %s node:worker_threads", async (_label, load) => {
+      const worker = new Worker(
+        `${load}
+         const keepAlive = setInterval(() => {}, 1 << 30);
+         process.on("workerMessage", (value, source) => {
+           process.stdout.write(JSON.stringify([value, source]) + "\\n");
+           if (value === "last") clearInterval(keepAlive);
+         });`,
+        { eval: true, stdout: true },
+      );
+      let stdout = "";
+      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      await postMessageToThread(worker.threadId, "first");
+      await postMessageToThread(worker.threadId, "last");
+      await once(worker, "exit");
+      expect(stdout).toBe(`["first",0]\n["last",0]\n`);
+    });
+
+    test("rejects when the worker has no 'workerMessage' listener", async () => {
+      const worker = new Worker(`setInterval(() => {}, 1 << 30);`, { eval: true });
+      try {
+        expect(await postMessageToThread(worker.threadId, "message").catch(e => e.code)).toBe(
+          "ERR_WORKER_MESSAGING_FAILED",
+        );
+      } finally {
+        await worker.terminate();
+      }
+    });
+
+    test("rejects when the worker's entry point throws", async () => {
+      const worker = new Worker(`throw new Error("entry point");`, { eval: true });
+      const errored = once(worker, "error");
+      const exited = new Promise(resolve => worker.on("exit", resolve));
+      expect(await postMessageToThread(worker.threadId, "message").catch(e => e.code)).toBe(
+        "ERR_WORKER_MESSAGING_FAILED",
+      );
+      expect((await errored)[0].message).toBe("entry point");
+      await exited;
+    });
+
+    // Nothing in the worker answers a message that is still in its port when the thread exits.
+    test("rejects when the worker exits with the message in its port", async () => {
+      const sent = new Int32Array(new SharedArrayBuffer(4));
+      const worker = new Worker(
+        `process.on("workerMessage", () => {});
+         Atomics.wait(new Int32Array(require("node:worker_threads").workerData), 0, 0);
+         process.exit(0);`,
+        { eval: true, workerData: sent.buffer },
+      );
+      const reply = postMessageToThread(worker.threadId, "message").catch(e => e.code);
+      Atomics.store(sent, 0, 1);
+      Atomics.notify(sent, 0);
+      expect(await reply).toBe("ERR_WORKER_MESSAGING_FAILED");
+      await once(worker, "exit");
+    });
+  });
+
+  test("a port in workerData that the worker never reads closes when the worker exits", async () => {
+    const { port1, port2 } = new MessageChannel();
+    const closed = once(port1, "close");
+    const worker = new Worker("", { eval: true, workerData: { port: port2 }, transferList: [port2] });
+    await Promise.all([closed, once(worker, "exit")]);
+  });
+
+  describe("{ stdin: true }", () => {
+    test("a write to worker.stdin completes when the worker never reads process.stdin", async () => {
+      const worker = new Worker(`setInterval(() => {}, 1 << 30);`, { eval: true, stdin: true });
+      try {
+        const { promise, resolve } = Promise.withResolvers<Error | null | undefined>();
+        worker.stdin!.write("unread", resolve);
+        expect(await promise).toBeFalsy();
+      } finally {
+        await worker.terminate();
+      }
+    });
+
+    test("process.stdin read late has what the parent wrote before", async () => {
+      const worker = new Worker(
+        `require("node:worker_threads").parentPort.once("message", () => {
+           let text = "";
+           process.stdin.setEncoding("utf8").on("data", chunk => (text += chunk)).on("end", () => process.stdout.write(text));
+         });`,
+        { eval: true, stdin: true, stdout: true },
+      );
+      let stdout = "";
+      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      const { promise, resolve } = Promise.withResolvers<Error | null | undefined>();
+      worker.stdin!.write("first ", resolve);
+      await promise;
+      worker.postMessage("read");
+      worker.stdin!.end("second");
+      await once(worker, "exit");
+      expect(stdout).toBe("first second");
+    });
+  });
+
+  // As in Node for an ES module entry point.
+  test("an ES module entry point's nextTick callbacks run after its microtasks", async () => {
+    using dir = tempDir("worker-start-tick-order", {
+      "entry.mjs": `
+        const order = [];
+        queueMicrotask(() => order.push("microtask"));
+        process.nextTick(() => order.push("nextTick"));
+        Promise.resolve().then(() => order.push("then"));
+        setImmediate(() => process.stdout.write(order.join(" ")));
+      `,
+    });
+    const worker = new Worker(join(String(dir), "entry.mjs"), { stdout: true });
+    let stdout = "";
+    worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+    await once(worker, "exit");
+    expect(stdout).toBe("microtask then nextTick");
+  });
+
+  test("environmentData reaches a worker started by a worker that never loaded node:worker_threads", async () => {
+    setEnvironmentData("start-sequence", "inherited");
+    try {
+      const grandchild = `postMessage(require("node:worker_threads").getEnvironmentData("start-sequence"));`;
+      const result = await runWorker(`
+        const worker = new Worker(URL.createObjectURL(new Blob([${JSON.stringify(grandchild)}])));
+        worker.onmessage = event => {
+          process.stdout.write(String(event.data));
+          worker.terminate();
+        };
+      `);
+      expect(result).toEqual({ stdout: "inherited", stderr: "", exitCode: 0 });
+    } finally {
+      setEnvironmentData("start-sequence", undefined);
+    }
+  });
+
+  // A third argument makes the global constructor start a node worker. It has no channels to a
+  // node:worker_threads Worker object, so its stdio is the process's own.
+  test("a worker from the global constructor with a third argument", async () => {
+    using dir = tempDir("worker-start-three-arguments", {
+      "entry.cjs": `
+        const { parentPort, workerData } = require("node:worker_threads");
+        console.log("console");
+        process.stdout.write("stdout\\n");
+        parentPort.postMessage([process.chdir.disabled, workerData]);
+      `,
+      "main.cjs": `
+        const worker = new Worker(__dirname + "/entry.cjs", { workerData: "data" }, {});
+        worker.onmessage = event => {
+          console.log(JSON.stringify(event.data));
+          worker.terminate();
+        };
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "main.cjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect(stdout).toBe(`console\nstdout\n[true,"data"]\n`);
+    expect(exitCode).toBe(0);
+  });
+});

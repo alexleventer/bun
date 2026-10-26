@@ -5197,7 +5197,7 @@ void Process::installNodeWorkerStdioFlushListeners(JSC::VM& vm)
     auto* globalObject = defaultGlobalObject(this->globalObject());
     auto exit = Identifier::fromString(vm, "exit"_s);
     for (auto flush : { Process_functionFlushNodeWorkerStdout, Process_functionFlushNodeWorkerStderr }) {
-        // Named as the stream's own function that the listener used to be.
+        // process.listeners("exit") shows it under the name of the stream function it calls.
         auto* listener = JSFunction::create(vm, globalObject, 0, "onAck"_s, flush, ImplementationVisibility::Public);
         wrapped().addListener(exit, WebCore::JSEventListener::create(*listener, *this, false, globalObject->world()), false, false);
         // The listener map holds the function weakly and is only marked through this object.

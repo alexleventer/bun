@@ -39,12 +39,14 @@ const {
 // Only the main thread (the hub) has these.
 // SafeMap: its prototype is a frozen null-proto snapshot taken at bootstrap, so the
 // cross-thread routing table can't be broken by user code replacing Map.prototype.
-const SafeMap = isMainThread ? require("internal/primordials").SafeMap : undefined;
-const threadsPorts: Map<number, import("node:worker_threads").MessagePort> = isMainThread ? new SafeMap() : undefined;
+function hubMap<K, V>(): Map<K, V> {
+  return isMainThread ? new (require("internal/primordials").SafeMap)() : undefined!;
+}
+const threadsPorts = hubMap<number, import("node:worker_threads").MessagePort>();
 // What the hub routed to a thread and has seen no reply to, by destination. A thread can exit
 // with such a message still in its port, or on its way there, and then nothing on that thread
 // answers it: the hub does, when it sees the thread's port close (failUnanswered).
-const unansweredByThread: Map<number, SharedArrayBuffer[]> = isMainThread ? new SafeMap() : undefined;
+const unansweredByThread = hubMap<number, SharedArrayBuffer[]>();
 
 // SharedArrayBuffer must always be Int32, so it's * 4.
 // One slot for the operation status (performing / performed) and one for the result.

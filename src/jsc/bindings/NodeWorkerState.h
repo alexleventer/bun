@@ -39,6 +39,9 @@ public:
     // arguments: its stdio is the process's, its console the native one, and it has no parentPort.
     bool hasChannels() const { return !!m_ports[NodePort::Stdout]; }
     WebCore::MessagePort* port(NodePort which) const { return m_ports[which].get(); }
+    // Until the worker builds what reads the Stdin / Hub port, a native listener stands on it and
+    // builds that on the first message (NodeWorkerState.cpp). What is built listens for itself.
+    void stopListeningForArrival(NodePort);
 
     // process.stdin (0) / stdout (1) / stderr (2) over the parent's ports, built on first use.
     // Throws and stays unbuilt when the build fails, so a later read tries again.

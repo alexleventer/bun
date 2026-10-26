@@ -394,6 +394,8 @@ JSValue createNodeWorkerMessagingBinding(Zig::GlobalObject* globalObject)
         if (auto* port = nodeWorker->port(WorkerOptions::Hub)) {
             hubPort = toJS(globalObject, globalObject, *port);
             RETURN_IF_EXCEPTION(scope, {});
+            // The module listens on it from here on.
+            nodeWorker->stopListeningForArrival(WorkerOptions::Hub);
         }
     }
 

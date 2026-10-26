@@ -131,7 +131,7 @@ function makePortWritable(port: MessagePort) {
       port.removeEventListener("message", onAck);
       cb(err);
     },
-  });
+  } as import("node:stream").WritableOptions);
   // On a synchronous exit no ack can arrive; completing the parked writev lets
   // the Writable clear its buffer through writev, which now completes
   // synchronously because process._exiting is set (node's flushSync).

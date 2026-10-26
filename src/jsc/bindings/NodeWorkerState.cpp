@@ -30,10 +30,11 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(NodeWorkerState);
 NodeWorkerState::NodeWorkerState() = default;
 NodeWorkerState::~NodeWorkerState() = default;
 
-// Stands on a port until its first message. The worker has not built what receives that port's
-// messages: process.stdin (the parent wrote to worker.stdin) or internal/worker/messaging (a thread
-// called postMessageToThread). The message builds it and is then handed to the listeners the build
-// attached, so a worker that gets no such message loads neither.
+// Stands on a port for as long as the worker has not built what receives that port's messages:
+// process.stdin (the parent writes to worker.stdin) or internal/worker/messaging (a thread calls
+// postMessageToThread). The first message builds it. What is built takes this listener off the
+// port (stopListeningForArrival) and attaches its own, which that message is then handed to. A
+// worker that gets no such message builds neither.
 class NodeWorkerPortArrivalListener final : public EventListener {
 public:
     static Ref<NodeWorkerPortArrivalListener> create(NodeWorkerState::NodePort port)
@@ -55,14 +56,10 @@ public:
 
         auto& vm = globalObject->vm();
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-        if (m_port == NodeWorkerState::NodePort::Stdin) {
-            // Building the reader takes this listener off the port.
+        if (m_port == NodeWorkerState::NodePort::Stdin)
             state->stdioStream(*globalObject, 0);
-        } else {
+        else
             globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::Field::InternalWorkerMessaging);
-            if (!scope.exception())
-                target.removeEventListener(eventNames().messageEvent, *this, {});
-        }
         if (auto* exception = scope.exception()) [[unlikely]] {
             if (!vm.isTerminationException(exception)) {
                 scope.clearException();
@@ -98,9 +95,12 @@ static void listenForArrival(Zig::GlobalObject& globalObject, MessagePort& port,
     static_cast<EventTarget&>(port).addEventListener(eventNames().messageEvent, NodeWorkerPortArrivalListener::create(which), {});
 }
 
-static void stopListeningForArrival(MessagePort& port)
+void NodeWorkerState::stopListeningForArrival(NodePort which)
 {
-    EventTarget& target = port;
+    RefPtr port = m_ports[which];
+    if (!port)
+        return;
+    EventTarget& target = *port;
     EventListenerVector listeners = target.eventListeners(eventNames().messageEvent);
     for (auto& registered : listeners) {
         if (registered->callback().type() == EventListener::NativeEventListenerType)
@@ -140,10 +140,9 @@ void NodeWorkerState::takeFromParent(Zig::GlobalObject& globalObject, WorkerOpti
         if (globalObject.hasProcessObject())
             globalObject.processObject()->installNodeWorkerStdioFlushListeners(vm);
 
-        // The global arms a hook that drains the tick queue from inside the microtask drain in
-        // which the queue first shows up (ZigGlobalObject.cpp). In these workers the queue used to
-        // exist before the entry ran, made by the stdio setup that is now deferred, so the hook
-        // was spent by then and the entry's ticks ran after its microtasks. They still do.
+        // The process.nextTick callbacks that the entry queues run after the microtasks it queues
+        // (Node's order for an ES module entry). The global arms a one-shot hook that would run
+        // them first (ZigGlobalObject.cpp).
         vm.setOnEachMicrotaskTick(nullptr);
     }
 
@@ -219,8 +218,7 @@ JSValue NodeWorkerState::stdioStream(Zig::GlobalObject& globalObject, unsigned f
     if (fd == 0) {
         stream = asObject(result);
         // The reader listens for itself from here on.
-        if (port)
-            stopListeningForArrival(*port);
+        stopListeningForArrival(NodePort::Stdin);
     } else {
         // [stream, flush], as getStdioWriteStream returns [stream, sink].
         auto* pair = uncheckedDowncast<JSArray>(result);

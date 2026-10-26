@@ -798,8 +798,9 @@ class Worker extends EventEmitter {
         stderrChannel.port2,
         channel.portToWorker,
         publicChannel.port2,
-        // FileHandles of the transferList are markers inside workerData now. Only this module
-        // turns them back into FileHandles, so the worker evaluates it before its entry point.
+        // packJSTransferables() above left markers inside workerData for the FileHandles of the
+        // transferList. Only this module turns them back into FileHandles, so the worker
+        // evaluates it before its entry point.
         options[kRestoreJSTransferables] !== undefined,
       ];
       options = {
