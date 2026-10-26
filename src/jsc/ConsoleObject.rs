@@ -430,44 +430,21 @@ fn message_with_type_and_level_(
     let use_stderr = matches!(level, MessageLevel::Warning | MessageLevel::Error)
         || message_type == MessageType::Assert;
     // SAFETY: see [`vm_console`]; a read of a `Copy` field, no reference is kept.
-    let to_worker_stdio = unsafe { (*console).output } == ConsoleOutput::WorkerStdio;
-    // A worker's channel is its own, and the write to it can run JS: no lock is held across it.
-    let _stream_lock = (!to_worker_stdio).then(|| ConsoleStreamLock::acquire(use_stderr));
+    if unsafe { (*console).output } == ConsoleOutput::WorkerStdio {
+        return message_to_worker_stdio(
+            console,
+            message_type,
+            level,
+            global,
+            vals,
+            len,
+            use_stderr,
+        );
+    }
+    let _stream_lock = ConsoleStreamLock::acquire(use_stderr);
 
     if message_type == MessageType::Clear {
-        if !to_worker_stdio {
-            Output::reset_terminal();
-        }
-        return Ok(());
-    }
-
-    if to_worker_stdio {
-        // SAFETY: see [`vm_console`]; not mutated again until `_indent_guard` runs.
-        let default_indent = unsafe { (*console).default_indent };
-        let colors = worker_stdio_colors();
-        let mut buffer: Vec<u8> = Vec::new();
-        if len == 0 && message_type == MessageType::Assert {
-            buffer.extend_from_slice(pfmt!("<r><red>Assertion failed<r>\n", colors).as_bytes());
-        } else if len == 0 && message_type == MessageType::Log {
-            buffer.push(b'\n');
-        } else {
-            if let Some(hooks) = crate::virtual_machine::runtime_hooks() {
-                (hooks.console_on_before_print)();
-            }
-            // SAFETY: caller (JSC C++) guarantees `vals` points to `len` JSValues.
-            let vals = unsafe { bun_core::ffi::slice(vals, len) };
-            write_message(
-                message_type,
-                level,
-                global,
-                vals,
-                &mut buffer,
-                colors,
-                colors,
-                default_indent,
-            )?;
-        }
-        write_to_worker_stdio(global, use_stderr, &buffer);
+        Output::reset_terminal();
         return Ok(());
     }
 
@@ -545,7 +522,51 @@ fn message_with_type_and_level_(
     )
 }
 
+/// The console of a `node:worker_threads` worker: one message, formatted into a buffer and handed to the worker's stdout / stderr channel.
+#[inline(never)]
+fn message_to_worker_stdio(
+    console: *mut ConsoleObject,
+    message_type: MessageType,
+    level: MessageLevel,
+    global: &JSGlobalObject,
+    vals: *const JSValue,
+    len: usize,
+    use_stderr: bool,
+) -> JsResult<()> {
+    if message_type == MessageType::Clear {
+        return Ok(());
+    }
+    // SAFETY: see [`vm_console`]; not mutated again until the caller's `_indent_guard` runs.
+    let default_indent = unsafe { (*console).default_indent };
+    let colors = worker_stdio_colors();
+    let mut buffer: Vec<u8> = Vec::new();
+    if len == 0 && message_type == MessageType::Assert {
+        buffer.extend_from_slice(pfmt!("<r><red>Assertion failed<r>\n", colors).as_bytes());
+    } else if len == 0 && message_type == MessageType::Log {
+        buffer.push(b'\n');
+    } else {
+        if let Some(hooks) = crate::virtual_machine::runtime_hooks() {
+            (hooks.console_on_before_print)();
+        }
+        // SAFETY: caller (JSC C++) guarantees `vals` points to `len` JSValues.
+        let vals = unsafe { bun_core::ffi::slice(vals, len) };
+        write_message(
+            message_type,
+            level,
+            global,
+            vals,
+            &mut buffer,
+            colors,
+            colors,
+            default_indent,
+        )?;
+    }
+    write_to_worker_stdio(global, use_stderr, &buffer);
+    Ok(())
+}
+
 /// Formats one console message to `writer`: what follows the choice of the writer.
+#[inline(always)]
 fn write_message(
     message_type: MessageType,
     level: MessageLevel,
@@ -5820,14 +5841,27 @@ pub(crate) extern "C" fn Bun__ConsoleObject__count(
     } + 1;
     *counter.value_ptr = current;
 
-    let to_worker_stdio = this.output == ConsoleOutput::WorkerStdio;
-    let mut buffer: Vec<u8> = Vec::new();
-    let (writer, colors): (&mut dyn bun_io::Write, bool) = if to_worker_stdio {
-        (&mut buffer, worker_stdio_colors())
-    } else {
-        (this.writer(), Output::enable_ansi_colors_stdout())
-    };
-    if colors {
+    if this.output == ConsoleOutput::WorkerStdio {
+        let colors = worker_stdio_colors();
+        let mut buffer: Vec<u8> = Vec::new();
+        let _ = bun_io::Write::write_fmt(
+            &mut buffer,
+            format_args!(
+                "{}{}{}: {}{}{}\n",
+                pfmt!("<r>", colors),
+                bstr::BStr::new(slice),
+                pfmt!("<d>", colors),
+                pfmt!("<r><yellow>", colors),
+                current,
+                pfmt!("<r>", colors),
+            ),
+        );
+        write_to_worker_stdio(global_this, false, &buffer);
+        return;
+    }
+
+    let writer = this.writer();
+    if Output::enable_ansi_colors_stdout() {
         let _ = writeln!(
             writer,
             "{}{}{}: {}{}{}",
@@ -5842,9 +5876,6 @@ pub(crate) extern "C" fn Bun__ConsoleObject__count(
         let _ = writeln!(writer, "{}: {}", bstr::BStr::new(slice), current);
     }
     let _ = writer.flush();
-    if to_worker_stdio {
-        write_to_worker_stdio(global_this, false, &buffer);
-    }
 }
 
 #[unsafe(no_mangle)]
@@ -5954,6 +5985,33 @@ fn worker_stdio_elapsed(elapsed: f64, label: &[u8], colors: bool) -> Vec<u8> {
     buffer
 }
 
+fn time_log_to_worker_stdio(global: &JSGlobalObject, elapsed: f64, label: &[u8], args: &[JSValue]) {
+    let colors = worker_stdio_colors();
+    let mut buffer = worker_stdio_elapsed(elapsed, label, colors);
+    let mut fmt = Formatter::new(global);
+    fmt.max_depth = bun_options_types::context::try_get()
+        .and_then(|ctx| ctx.runtime_options.console_depth)
+        .unwrap_or(DEFAULT_CONSOLE_LOG_DEPTH);
+    fmt.can_throw_stack_overflow = true;
+    for &arg in args {
+        let Ok(tag) = formatter::Tag::get(arg, global) else {
+            return;
+        };
+        buffer.push(b' ');
+        let formatted = if colors {
+            fmt.format::<true>(tag, &mut buffer, arg, global)
+        } else {
+            fmt.format::<false>(tag, &mut buffer, arg, global)
+        };
+        // Formatting ran JS that threw: the exception is the caller's, and nothing is written.
+        if formatted.is_err() {
+            return;
+        }
+    }
+    buffer.push(b'\n');
+    write_to_worker_stdio(global, true, &buffer);
+}
+
 #[unsafe(no_mangle)]
 #[crate::host_call]
 pub(crate) extern "C" fn Bun__ConsoleObject__timeLog(
@@ -5976,17 +6034,18 @@ pub(crate) extern "C" fn Bun__ConsoleObject__timeLog(
     // get the duration in microseconds, then display it in milliseconds
     let elapsed =
         (value.read() / bun_core::time::NS_PER_US) as f64 / bun_core::time::US_PER_MS as f64;
-    let console = vm_console(global);
     // SAFETY: see [`vm_console`]; a read of a `Copy` field.
-    let to_worker_stdio = unsafe { (*console).output } == ConsoleOutput::WorkerStdio;
-    if !to_worker_stdio {
-        Output::print_elapsed(elapsed);
-        match slice.len() {
-            0 => {}
-            _ => Output::print_error(format_args!(" {}", bstr::BStr::new(slice))),
-        }
-        Output::flush();
+    if unsafe { (*vm_console(global)).output } == ConsoleOutput::WorkerStdio {
+        // SAFETY: caller passes a valid (args, args_len) pair.
+        let args = unsafe { bun_core::ffi::slice(args, args_len) };
+        return time_log_to_worker_stdio(global, elapsed, slice, args);
     }
+    Output::print_elapsed(elapsed);
+    match slice.len() {
+        0 => {}
+        _ => Output::print_error(format_args!(" {}", bstr::BStr::new(slice))),
+    }
+    Output::flush();
 
     // print the arguments
     // `Formatter` has a `Drop` impl, so struct-update from a
@@ -5996,29 +6055,7 @@ pub(crate) extern "C" fn Bun__ConsoleObject__timeLog(
         .and_then(|ctx| ctx.runtime_options.console_depth)
         .unwrap_or(DEFAULT_CONSOLE_LOG_DEPTH);
     fmt.can_throw_stack_overflow = true;
-    if to_worker_stdio {
-        let colors = worker_stdio_colors();
-        let mut buffer = worker_stdio_elapsed(elapsed, slice, colors);
-        // SAFETY: caller passes a valid (args, args_len) pair.
-        for &arg in unsafe { bun_core::ffi::slice(args, args_len) } {
-            let Ok(tag) = formatter::Tag::get(arg, global) else {
-                return;
-            };
-            buffer.push(b' ');
-            let formatted = if colors {
-                fmt.format::<true>(tag, &mut buffer, arg, global)
-            } else {
-                fmt.format::<false>(tag, &mut buffer, arg, global)
-            };
-            // Formatting ran JS that threw: the exception is the caller's, and nothing is written.
-            if formatted.is_err() {
-                return;
-            }
-        }
-        buffer.push(b'\n');
-        write_to_worker_stdio(global, true, &buffer);
-        return;
-    }
+    let console = vm_console(global);
     // SAFETY: see [`vm_console`] — points at the live boxed `ConsoleObject` for
     // this VM; JS-thread-only. Kept as a raw deref (not `vm_console_mut`) so the
     // resulting `writer` borrow does not pin a long-lived `&mut ConsoleObject`
