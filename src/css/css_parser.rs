@@ -2857,16 +2857,22 @@ where
                                 },
                             )
                         };
-                        if result.is_err() && parse_qualified {
-                            self.input.reset(&start);
-                            if let Ok(qual) = parse_qualified_rule(
-                                &start,
-                                self.input,
-                                self.parser,
-                                Delimiters::SEMICOLON | Delimiters::CURLY_BRACKET,
-                            ) {
-                                return Some(Ok(qual));
+                        if result.is_err() {
+                            if parse_qualified {
+                                self.input.reset(&start);
+                                if let Ok(qual) = parse_qualified_rule(
+                                    &start,
+                                    self.input,
+                                    self.parser,
+                                    Delimiters::SEMICOLON | Delimiters::CURLY_BRACKET,
+                                ) {
+                                    return Some(Ok(qual));
+                                }
                             }
+                            // Not in cssparser: a failed declaration has no AST value,
+                            // so its import records go too.
+                            self.input
+                                .truncate_import_records(start.import_record_count);
                         }
                         return Some(result);
                     }
@@ -3691,11 +3697,15 @@ impl<'a> Parser<'a> {
     pub(crate) fn reset(&mut self, state_: &ParserState) {
         self.input.tokenizer.reset(state_);
         self.at_start_of = state_.at_start_of;
+        // Roll back any speculatively-added @import/url() records.
+        self.truncate_import_records(state_.import_record_count);
+    }
+
+    /// Removes the import records after the first `count`. The tokenizer does not move.
+    pub(crate) fn truncate_import_records(&mut self, count: u32) {
         if let Some(ptr) = self.import_records {
-            // Roll back any speculatively-added @import/url() records.
             // SAFETY: see `Parser.import_records` field doc.
-            unsafe { &mut *ptr.as_ptr() }
-                .shrink_retaining_capacity(state_.import_record_count as usize);
+            unsafe { &mut *ptr.as_ptr() }.shrink_retaining_capacity(count as usize);
         }
     }
 

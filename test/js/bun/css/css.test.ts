@@ -8347,6 +8347,19 @@ for (const source of ${JSON.stringify(cases.map(([source]) => source))}) console
     expect(exitCode).toBe(0);
   });
 
+  // Bundles `css` as the file `name`. `files` are the other files of its directory.
+  // In the result, `files` are the output files. An asset has a hash in its name.
+  async function bundle(css: string, files: Record<string, string | Buffer> = {}, name = "in.css") {
+    using dir = tempDir("css-invalid-item", { [name]: css, ...files });
+    const result = await Bun.build({ entrypoints: [join(String(dir), name)], minify: true, throw: false });
+    return {
+      success: result.success,
+      logs: result.logs.map(log => `${log.level}: ${log.message}`),
+      files: result.outputs.map(output => output.path.replace(/-[a-z0-9]{8}\./, "-[hash].")),
+      css: result.success ? (await result.outputs[0].text()).trim() : "",
+    };
+  }
+
   // An invalid item in the block of a keyframe does not invalidate the keyframe:
   // a browser drops the item and keeps the other declarations.
   describe("a keyframe with an invalid item in its block", () => {
@@ -8431,34 +8444,169 @@ for (const source of ${JSON.stringify(cases.map(([source]) => source))}) console
 
     // The declarations after the invalid item are part of the sheet now, so
     // the bundler resolves a `url()` in them.
-    async function bundle(css: string, files: Record<string, string> = {}) {
-      using dir = tempDir("css-keyframe-invalid-item", { "in.css": css, ...files });
-      const result = await Bun.build({ entrypoints: [join(String(dir), "in.css")], minify: true, throw: false });
-      return {
-        success: result.success,
-        logs: result.logs.map(log => `${log.level}: ${log.message}`),
-        css: result.success ? (await result.outputs[0].text()).trim() : "",
-      };
-    }
-
-    test("a url() after the invalid item is bundled", async () => {
+    test.concurrent("a url() after the invalid item is bundled", async () => {
       expect(
         await bundle("@keyframes k { from { 123: x; background: url(./a.txt) } to { opacity: 1 } }", { "a.txt": "a" }),
       ).toEqual({
         success: true,
         logs: [],
+        files: ["./in.css"],
         css: "@keyframes k{0%{background:url(data:text/plain;base64,YQ==)}to{opacity:1}}",
       });
     });
 
-    test("a url() after the invalid item that does not resolve fails the build", async () => {
+    test.concurrent("a url() after the invalid item that does not resolve fails the build", async () => {
       expect(
         await bundle("@keyframes k { from { 123: x; background: url(./missing.png) } to { opacity: 1 } }"),
       ).toEqual({
         success: false,
         logs: ['error: Could not resolve: "./missing.png"'],
+        files: [],
         css: "",
       });
+    });
+
+    // The invalid item is not in the output, so a `url()` in it is not an import.
+    test.concurrent("a url() in the invalid item is not bundled", async () => {
+      expect(
+        await bundle("@keyframes k { from { 123: x; background: url(./missing.png) !importan } to { opacity: 1 } }"),
+      ).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@keyframes k{0%{}to{opacity:1}}",
+      });
+      expect(
+        await bundle(
+          "@keyframes k { from { background: url(./a.txt); color: url(./missing.png) ) ; top: 0 } to { opacity: 1 } }",
+          { "a.txt": "a" },
+        ),
+      ).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@keyframes k{0%{background:url(data:text/plain;base64,YQ==);top:0}to{opacity:1}}",
+      });
+    });
+  });
+
+  // A declaration that fails to parse is not in the output. A `url()` or a
+  // `composes ... from` in it is not an import: the bundler does not resolve it
+  // and does not write its file.
+  describe("a declaration that fails to parse leaves no import", () => {
+    test.concurrent("in @font-face", async () => {
+      expect(await bundle("@font-face { font-family: x; src: url(./missing.woff) !importan }")).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@font-face{font-family:x}",
+      });
+      // The import of a valid descriptor stays, before and after the invalid one.
+      expect(
+        await bundle(
+          "@font-face { font-family: x; src: url(./a.txt); src: url(./missing.woff) ) ; font-weight: 400 }",
+          { "a.txt": "a" },
+        ),
+      ).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@font-face{font-family:x;src:url(data:text/plain;base64,YQ==);font-weight:400}",
+      });
+      expect(
+        await bundle("@font-face { font-family: x; src: url(./missing.woff) ) ; src: url(./a.txt) }", { "a.txt": "a" }),
+      ).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@font-face{font-family:x;src:url(data:text/plain;base64,YQ==)}",
+      });
+    });
+
+    // `!important` is not valid on a descriptor. The file is too large to inline,
+    // so an import of it is an output file.
+    test.concurrent("in @font-face, the file of the url() is not written", async () => {
+      expect(
+        await bundle(
+          '@font-face { font-family: x; src: url(./big.bin) format("woff2") !important } .a { color: red }',
+          {
+            "big.bin": Buffer.alloc(200_000, "x"),
+          },
+        ),
+      ).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@font-face{font-family:x}.a{color:red}",
+      });
+    });
+
+    test.concurrent("a url() in a valid @font-face descriptor is still an import", async () => {
+      expect(await bundle("@font-face { font-family: x; src: url(./missing.woff) }")).toEqual({
+        success: false,
+        logs: ['error: Could not resolve: "./missing.woff"'],
+        files: [],
+        css: "",
+      });
+    });
+
+    test.concurrent("in @font-palette-values", async () => {
+      expect(
+        await bundle(
+          "@font-palette-values --x { font-family: a; base-palette: url(./missing.png) ) ; override-colors: 0 red }",
+        ),
+      ).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@font-palette-values --x{font-family:a;override-colors:0 red}",
+      });
+    });
+
+    test.concurrent("in the block of a keyframe", async () => {
+      // A custom property holds its `url()` as a token. `image-set()` takes a string.
+      for (const invalid of ["--x: url(./missing.png) )", 'background: image-set("./missing.png" 1x) !importan']) {
+        expect(await bundle(`@keyframes k { from { ${invalid}; top: 0 } to { opacity: 1 } }`)).toEqual({
+          success: true,
+          logs: [],
+          files: ["./in.css"],
+          css: "@keyframes k{0%{top:0}to{opacity:1}}",
+        });
+      }
+      // The import of a valid declaration behind the invalid one stays.
+      expect(
+        await bundle(
+          "@keyframes k { from { color: url(./missing.png) ) ; background: url(./a.txt) } to { opacity: 1 } }",
+          { "a.txt": "a" },
+        ),
+      ).toEqual({
+        success: true,
+        logs: [],
+        files: ["./in.css"],
+        css: "@keyframes k{0%{background:url(data:text/plain;base64,YQ==)}to{opacity:1}}",
+      });
+    });
+
+    // An import from `composes` puts the rules of the other file in the output.
+    test.concurrent("composes ... from in a CSS module", async () => {
+      const withoutHashes = ({ css, ...rest }: Awaited<ReturnType<typeof bundle>>) => ({
+        ...rest,
+        css: css.replace(/_[\w-]{6}(?=\{)/g, ""),
+      });
+      const sheet = (file: string) =>
+        `@keyframes k { from { opacity: 0; composes: b from "./${file}" !importan } to { opacity: 1 } } .a { color: red }`;
+      const expected = {
+        success: true,
+        logs: [],
+        files: ["./in.module.css"],
+        css: "@keyframes k{0%{opacity:0}to{opacity:1}}.a{color:red}",
+      };
+      expect(
+        withoutHashes(
+          await bundle(sheet("other.module.css"), { "other.module.css": ".b { color: blue }" }, "in.module.css"),
+        ),
+      ).toEqual(expected);
+      expect(withoutHashes(await bundle(sheet("missing.module.css"), {}, "in.module.css"))).toEqual(expected);
     });
   });
 });
