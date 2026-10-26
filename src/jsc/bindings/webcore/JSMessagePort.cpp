@@ -41,12 +41,9 @@
 #include "JSDOMWrapperCache.h"
 #include "JSEventListener.h"
 #include "JSStructuredSerializeOptions.h"
-#include "InternalModuleRegistry.h"
-#include "NodeWorkerState.h"
 #include "ScriptExecutionContext.h"
 #include "WebCoreJSClientData.h"
 // #include "WebCoreOpaqueRootInlines.h"
-#include <JavaScriptCore/CustomGetterSetter.h>
 #include <JavaScriptCore/HeapAnalyzer.h>
 #include <JavaScriptCore/IteratorOperations.h>
 #include <JavaScriptCore/JSArray.h>
@@ -73,7 +70,6 @@ static JSC_DECLARE_HOST_FUNCTION(jsMessagePortPrototypeFunction_hasRef);
 // Attributes
 
 static JSC_DECLARE_CUSTOM_GETTER(jsMessagePortConstructor);
-static JSC_DECLARE_CUSTOM_GETTER(jsMessagePortNodeWorkerMember);
 static JSC_DECLARE_CUSTOM_GETTER(jsMessagePort_onmessage);
 static JSC_DECLARE_CUSTOM_SETTER(setJSMessagePort_onmessage);
 static JSC_DECLARE_CUSTOM_GETTER(jsMessagePort_onmessageerror);
@@ -82,10 +78,10 @@ static JSC_DECLARE_CUSTOM_SETTER(setJSMessagePort_onmessageerror);
 class JSMessagePortPrototype final : public JSC::JSNonFinalObject {
 public:
     using Base = JSC::JSNonFinalObject;
-    static JSMessagePortPrototype* create(JSC::VM& vm, JSDOMGlobalObject* globalObject, JSC::Structure* structure, JSC::CustomGetterSetter* nodeWorkerMember)
+    static JSMessagePortPrototype* create(JSC::VM& vm, JSDOMGlobalObject* globalObject, JSC::Structure* structure)
     {
         JSMessagePortPrototype* ptr = new (NotNull, Bun::allocatePlainObjectCell(vm, sizeof(JSMessagePortPrototype))) JSMessagePortPrototype(vm, globalObject, structure);
-        ptr->finishCreation(vm, nodeWorkerMember);
+        ptr->finishCreation(vm);
         return ptr;
     }
 
@@ -107,7 +103,7 @@ private:
     {
     }
 
-    void finishCreation(JSC::VM&, JSC::CustomGetterSetter* nodeWorkerMember);
+    void finishCreation(JSC::VM&);
 };
 STATIC_ASSERT_ISO_SUBSPACE_SHARABLE(JSMessagePortPrototype, JSMessagePortPrototype::Base);
 
@@ -141,50 +137,11 @@ static const HashTableValue JSMessagePortPrototypeTableValues[] = {
 
 const ClassInfo JSMessagePortPrototype::s_info = { "MessagePort"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSMessagePortPrototype) };
 
-// In a worker of node:worker_threads, MessagePort.prototype has node's surface before any user code
-// runs, as in Node: the emitter methods on an object between it and EventTarget.prototype,
-// close(callback), and the util.inspect hook. node:worker_threads defines all of them, and the
-// worker does not evaluate it until something needs it, so until then each is a slot that
-// evaluates it on first read (jsMessagePortNodeWorkerMember).
-
-// In the order node:worker_threads defines them (injectFakeEmitter).
-static constexpr ASCIILiteral nodeEmitterMethodNames[] = {
-    "on"_s,
-    "off"_s,
-    "once"_s,
-    "emit"_s,
-    "addListener"_s,
-    "removeListener"_s,
-    "listenerCount"_s,
-    "eventNames"_s,
-    "removeAllListeners"_s,
-    "setMaxListeners"_s,
-    "getMaxListeners"_s,
-};
-
-static constexpr unsigned nodeEmitterMethodAttributes = PropertyAttribute::DontEnum | PropertyAttribute::CustomValue;
-static constexpr unsigned nodeCloseAttributes = PropertyAttribute::CustomValue | 0;
-static constexpr unsigned nodeInspectAttributes = PropertyAttribute::DontEnum | PropertyAttribute::CustomValue;
-
-void JSMessagePortPrototype::finishCreation(VM& vm, CustomGetterSetter* nodeWorkerMember)
+void JSMessagePortPrototype::finishCreation(VM& vm)
 {
     Base::finishCreation(vm);
-    std::span<const HashTableValue> table { JSMessagePortPrototypeTableValues };
-    if (!nodeWorkerMember) {
-        Bun::reifyStaticPropertyTable(vm, JSMessagePort::info(), table, *this);
-        Bun::putToStringTagWithoutTransition(vm, this, info());
-        return;
-    }
-
-    // "close" keeps its place among the own properties.
-    size_t closeIndex = 0;
-    while (table[closeIndex].m_key != "close"_s)
-        closeIndex++;
-    Bun::reifyStaticPropertyTable(vm, JSMessagePort::info(), table.first(closeIndex), *this);
-    putDirectCustomAccessor(vm, Identifier::fromString(vm, "close"_s), nodeWorkerMember, nodeCloseAttributes);
-    Bun::reifyStaticPropertyTable(vm, JSMessagePort::info(), table.subspan(closeIndex + 1), *this);
+    Bun::reifyStaticPropertyTable(vm, JSMessagePort::info(), JSMessagePortPrototypeTableValues, *this);
     Bun::putToStringTagWithoutTransition(vm, this, info());
-    putDirectCustomAccessor(vm, builtinNames(vm).inspectCustomPublicName(), nodeWorkerMember, nodeInspectAttributes);
 }
 
 const ClassInfo JSMessagePort::s_info = { "MessagePort"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSMessagePort) };
@@ -198,108 +155,9 @@ static_assert(std::is_base_of<ActiveDOMObject, MessagePort>::value, "Interface i
 
 JSObject* JSMessagePort::createPrototype(VM& vm, JSDOMGlobalObject& globalObject)
 {
-    JSObject* parentPrototype = JSEventTarget::prototype(vm, globalObject);
-    auto* nodeWorker = globalObject.nodeWorkerState();
-    CustomGetterSetter* nodeWorkerMember = nullptr;
-    JSObject* emitterPrototype = nullptr;
-    if (nodeWorker) {
-        nodeWorkerMember = CustomGetterSetter::create(vm, jsMessagePortNodeWorkerMember, nullptr);
-        emitterPrototype = JSC::constructEmptyObject(&globalObject, parentPrototype);
-        for (auto name : nodeEmitterMethodNames)
-            emitterPrototype->putDirectCustomAccessor(vm, Identifier::fromString(vm, name), nodeWorkerMember, nodeEmitterMethodAttributes);
-        parentPrototype = emitterPrototype;
-    }
-    auto* structure = JSMessagePortPrototype::createStructure(vm, &globalObject, parentPrototype);
+    auto* structure = JSMessagePortPrototype::createStructure(vm, &globalObject, JSEventTarget::prototype(vm, globalObject));
     structure->setMayBePrototype(true);
-    auto* prototype = JSMessagePortPrototype::create(vm, &globalObject, structure, nodeWorkerMember);
-    if (nodeWorker)
-        nodeWorker->setMessagePortPrototypes(vm, globalObject, prototype, emitterPrototype);
-    return prototype;
-}
-
-static bool isNodeWorkerMemberSlot(VM& vm, JSObject* object, PropertyName name)
-{
-    JSValue value = object->getDirect(vm, name);
-    auto* accessor = value ? dynamicDowncast<CustomGetterSetter>(value) : nullptr;
-    return accessor && accessor->getter() == jsMessagePortNodeWorkerMember;
-}
-
-JSObject* JSMessagePort::retireNodeWorkerMemberSlots(VM& vm, Zig::GlobalObject& globalObject)
-{
-    auto* nodeWorker = globalObject.nodeWorkerState();
-    if (!nodeWorker)
-        return nullptr;
-    JSObject* emitterPrototype = nodeWorker->messagePortEmitterPrototype();
-    if (!emitterPrototype || !nodeWorker->hasMessagePortMemberSlots())
-        return emitterPrototype;
-    nodeWorker->setHasMessagePortMemberSlots(false);
-
-    JSObject* prototype = nodeWorker->messagePortPrototype();
-    for (auto name : nodeEmitterMethodNames) {
-        auto identifier = Identifier::fromString(vm, name);
-        if (isNodeWorkerMemberSlot(vm, emitterPrototype, identifier))
-            emitterPrototype->deleteProperty(&globalObject, identifier);
-    }
-    // What the slot stood in front of: the module wraps this function.
-    auto closeName = Identifier::fromString(vm, "close"_s);
-    if (isNodeWorkerMemberSlot(vm, prototype, closeName)) {
-        auto* nativeClose = JSFunction::create(vm, &globalObject, 0, "close"_s, jsMessagePortPrototypeFunction_close, ImplementationVisibility::Public);
-        prototype->putDirect(vm, closeName, nativeClose, 0);
-        nodeWorker->setMessagePortNativeClose(vm, globalObject, nativeClose);
-    }
-    auto& inspectName = builtinNames(vm).inspectCustomPublicName();
-    if (isNodeWorkerMemberSlot(vm, prototype, inspectName))
-        prototype->deleteProperty(&globalObject, inspectName);
-    return emitterPrototype;
-}
-
-// The module's evaluation threw after it had retired the slots: what it did not get to define is a
-// slot again, so the next read evaluates it again.
-static void restoreNodeWorkerMemberSlots(VM& vm, Zig::GlobalObject& globalObject, Bun::NodeWorkerState& nodeWorker)
-{
-    if (nodeWorker.hasMessagePortMemberSlots())
-        return;
-    nodeWorker.setHasMessagePortMemberSlots(true);
-
-    auto* member = CustomGetterSetter::create(vm, jsMessagePortNodeWorkerMember, nullptr);
-    JSObject* emitterPrototype = nodeWorker.messagePortEmitterPrototype();
-    for (auto name : nodeEmitterMethodNames) {
-        auto identifier = Identifier::fromString(vm, name);
-        if (!emitterPrototype->getDirect(vm, identifier))
-            emitterPrototype->putDirectCustomAccessor(vm, identifier, member, nodeEmitterMethodAttributes);
-    }
-    JSObject* prototype = nodeWorker.messagePortPrototype();
-    auto closeName = Identifier::fromString(vm, "close"_s);
-    JSObject* nativeClose = nodeWorker.messagePortNativeClose();
-    if (nativeClose && prototype->getDirect(vm, closeName) == JSValue(nativeClose)) {
-        prototype->deleteProperty(&globalObject, closeName);
-        prototype->putDirectCustomAccessor(vm, closeName, member, nodeCloseAttributes);
-    }
-    auto& inspectName = builtinNames(vm).inspectCustomPublicName();
-    if (!prototype->getDirect(vm, inspectName))
-        prototype->putDirectCustomAccessor(vm, inspectName, member, nodeInspectAttributes);
-}
-
-JSC_DEFINE_CUSTOM_GETTER(jsMessagePortNodeWorkerMember, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName propertyName))
-{
-    auto& vm = JSC::getVM(lexicalGlobalObject);
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    // The object that has the slot: MessagePort.prototype or the emitter prototype.
-    auto* owner = JSValue::decode(thisValue).getObject();
-    auto* globalObject = owner ? dynamicDowncast<Zig::GlobalObject>(owner->globalObject()) : nullptr;
-    auto* nodeWorker = globalObject ? globalObject->nodeWorkerState() : nullptr;
-    if (!nodeWorker || nodeWorker->isLoadingMessagePortMembers()) [[unlikely]]
-        return JSValue::encode(jsUndefined());
-
-    // Its binding call retires every slot, and its body then defines the members.
-    nodeWorker->setIsLoadingMessagePortMembers(true);
-    globalObject->internalModuleRegistry()->requireId(globalObject, vm, Bun::InternalModuleRegistry::Field::NodeWorkerThreads);
-    nodeWorker->setIsLoadingMessagePortMembers(false);
-    if (scope.exception()) [[unlikely]] {
-        restoreNodeWorkerMemberSlots(vm, *globalObject, *nodeWorker);
-        return {};
-    }
-    RELEASE_AND_RETURN(scope, JSValue::encode(owner->get(globalObject, propertyName)));
+    return JSMessagePortPrototype::create(vm, &globalObject, structure);
 }
 
 JSObject* JSMessagePort::prototype(VM& vm, JSDOMGlobalObject& globalObject)
