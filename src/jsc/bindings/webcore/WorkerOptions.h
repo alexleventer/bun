@@ -28,18 +28,14 @@ struct WorkerOptions {
     // Blob URL.
     bool evalMode { false };
     Kind kind { Kind::Web };
-    // Kind::Node: workerData carries FileHandle markers. Only node:worker_threads can turn them
-    // back into FileHandles, so the worker loads it before its entry point.
+    // Kind::Node: workerData carries the markers that node:worker_threads turns back into FileHandles.
     bool workerDataHasJSTransferables { false };
-    // Kind::Node: the worker's process.env will have NODE_CHANNEL_FD (JSVMClientData).
-    bool envNamesIPCChannel { false };
     // Serialized array containing [workerData, environmentData]
     // (environmentData is always a Map)
     RefPtr<SerializedScriptValue> workerDataAndEnvironmentData;
     // Objects transferred for either data or environmentData in the transferList
     Vector<TransferredMessagePort> dataMessagePorts;
-    // The worker's ends of the channels that the `Worker` object of node:worker_threads makes for it.
-    // The first three are indexed by fd; Stdin has no pipe unless the worker was given { stdin: true }.
+    // Kind::Node: the worker's ends of the channels that node:worker_threads' Worker makes for it. The first three are indexed by fd.
     enum NodePort : uint8_t {
         Stdin,
         Stdout,
@@ -50,9 +46,7 @@ struct WorkerOptions {
         Parent,
         NodePortCount,
     };
-    // One per NodePort, or empty: Kind::Web, and a Worker that the global constructor made with
-    // three arguments. In transit until the worker's start sequence entangles them
-    // (NodeWorkerState::takeFromParent).
+    // One per NodePort (Stdin has no pipe without { stdin: true }), in transit until the worker's start sequence entangles them. Empty for Kind::Web.
     Vector<TransferredMessagePort> nodePorts;
     Vector<String> preloadModules;
     std::optional<HashMap<String, String>> env;
