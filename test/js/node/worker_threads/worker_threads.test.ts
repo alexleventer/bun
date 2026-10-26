@@ -3656,31 +3656,38 @@ describe("node worker start sequence", () => {
       expect(exitCode).toBe(0);
     });
 
-    // The worker's streams are not TTYs.
-    test("has no colors when the console of the process has", async () => {
+    // The worker's streams are not TTYs. As in Node, FORCE_COLOR still colors what goes to them.
+    test.each([
+      ["has colors with FORCE_COLOR", "1", true],
+      ["has no colors without it", undefined, false],
+    ])("%s", async (_label, FORCE_COLOR, colored) => {
       await using proc = Bun.spawn({
         cmd: [
           bunExe(),
           "-e",
           `const { Worker } = require("node:worker_threads");
-           const worker = new Worker('console.log("log", { a: 1 }); console.table([{ x: 1 }]); console.count(); console.trace("trace"); console.error(new Error("error")); console.time("t"); console.timeEnd("t")', { eval: true, stdout: true, stderr: true });
-           let output = "";
-           worker.stdout.setEncoding("utf8").on("data", chunk => (output += chunk));
-           worker.stderr.setEncoding("utf8").on("data", chunk => (output += chunk));
-           worker.on("exit", () => console.log(JSON.stringify({ output, colored: Bun.inspect({ a: 1 }, { colors: Bun.enableANSIColors }) !== Bun.inspect({ a: 1 }) })));`,
+           const worker = new Worker('console.log("log", { a: 1 }); console.table([{ x: 1 }]); console.count(); console.trace("trace"); console.error({ b: 2 }); console.time("t"); console.timeEnd("t"); console.assert(false)', { eval: true, stdout: true, stderr: true });
+           const output = { stdout: "", stderr: "" };
+           worker.stdout.setEncoding("utf8").on("data", chunk => (output.stdout += chunk));
+           worker.stderr.setEncoding("utf8").on("data", chunk => (output.stderr += chunk));
+           worker.on("exit", () => console.log(JSON.stringify(output)));`,
         ],
-        env: { ...bunEnv, FORCE_COLOR: "1", NO_COLOR: undefined },
+        env: { ...bunEnv, FORCE_COLOR, NO_COLOR: undefined },
         stdout: "pipe",
         stderr: "pipe",
       });
       const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
       expect(stderr).toBe("");
-      const { output, colored } = JSON.parse(stdout);
-      expect(colored).toBe(true);
-      expect(output).toContain("log {\n  a: 1,\n}\n");
-      expect(output).toContain("trace\n");
-      expect(output).toContain("error: error\n");
-      expect(output).not.toContain("\x1b[");
+      const output = JSON.parse(stdout);
+      expect({ stdout: output.stdout.includes("\x1b["), stderr: output.stderr.includes("\x1b[") }).toEqual({
+        stdout: colored,
+        stderr: colored,
+      });
+      expect(Bun.stripANSI(output.stdout)).toContain("log {\n  a: 1,\n}\n");
+      expect(Bun.stripANSI(output.stdout)).toContain("trace\n");
+      expect(Bun.stripANSI(output.stderr).replace(/\[\d+\.\d+m?s\]/, "[time]")).toBe(
+        "{\n  b: 2,\n}\n[time] t\nAssertion failed\n",
+      );
       expect(exitCode).toBe(0);
     });
 
