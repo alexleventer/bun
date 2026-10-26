@@ -155,7 +155,11 @@ private:
     bool m_closeEventDispatched { false };
     bool m_hasMessageEventListener { false };
     // See holdStartUntilEntrySettled().
-    enum class StartHold : uint8_t { None, Held, HeldWithStartRequested };
+    enum class StartHold : uint8_t {
+        None,
+        Held,
+        HeldWithStartRequested,
+    };
     StartHold m_startHold { StartHold::None };
     // Read from the GC thread: a port whose only listener is 'close' must survive
     // until that event is delivered, or the peer's close is lost to a collection.

@@ -159,7 +159,8 @@ function sendMessageToWorker(source, destination, value, transferList, memory) {
     // Most have a reply by now. Keep the rest.
     let kept = 0;
     for (let i = 0; i < unanswered.length; i++) {
-      if (Atomics.load(new Int32Array(unanswered[i]), WORKER_MESSAGING_STATUS_INDEX) === 0) unanswered[kept++] = unanswered[i];
+      if (Atomics.load(new Int32Array(unanswered[i]), WORKER_MESSAGING_STATUS_INDEX) === 0)
+        unanswered[kept++] = unanswered[i];
     }
     unanswered.length = kept;
   }
