@@ -422,25 +422,26 @@ template<> __attribute__((minsize)) JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES
     options.dataMessagePorts = WTF::move(transferredPorts);
 
     if (nodeChannels) {
-        std::array<TransferredMessagePort, WorkerOptions::NodePortCount> nodePorts;
+        Vector<TransferredMessagePort> nodePorts;
+        nodePorts.reserveInitialCapacity(WorkerOptions::NodePortCount);
         for (unsigned i = 0; i < WorkerOptions::NodePortCount; i++) {
             JSValue channel = nodeChannels->getIndex(lexicalGlobalObject, i);
             RETURN_IF_EXCEPTION(throwScope, {});
             auto* port = dynamicDowncast<JSMessagePort>(channel);
-            if (!port && i == WorkerOptions::Stdin)
+            if (!port && i == WorkerOptions::Stdin) {
+                nodePorts.append(TransferredMessagePort {});
                 continue;
+            }
             if (!port || port->wrapped().isDetached() || port->wrapped().isClosing()) {
                 WebCore::propagateException(*lexicalGlobalObject, throwScope, Exception { DataCloneError });
                 RELEASE_AND_RETURN(throwScope, {});
             }
-            auto transferred = port->wrapped().disentangle();
-            nodePorts[i].pipe = WTF::move(transferred.pipe);
-            nodePorts[i].side = transferred.side;
+            nodePorts.append(port->wrapped().disentangle());
         }
         JSValue hasJSTransferables = nodeChannels->getIndex(lexicalGlobalObject, WorkerOptions::NodePortCount);
         RETURN_IF_EXCEPTION(throwScope, {});
         options.workerDataHasJSTransferables = hasJSTransferables.toBoolean(lexicalGlobalObject);
-        options.nodePorts.emplace(WTF::move(nodePorts));
+        options.nodePorts = WTF::move(nodePorts);
     }
 
     auto object = Worker::create(*context, WTF::move(scriptUrl), WTF::move(options));

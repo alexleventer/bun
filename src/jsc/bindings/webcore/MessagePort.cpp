@@ -145,18 +145,16 @@ ExceptionOr<void> MessagePort::postMessage(JSC::JSGlobalObject& state, JSC::JSVa
 
 void MessagePort::entrySettled()
 {
-    m_holdsStartUntilEntrySettled = false;
-    if (!std::exchange(m_startDeferredUntilEntrySettled, false))
-        return;
-    start();
+    if (std::exchange(m_startHold, StartHold::None) == StartHold::HeldWithStartRequested)
+        start();
 }
 
 void MessagePort::start()
 {
     if (m_started || !isEntangled())
         return;
-    if (m_holdsStartUntilEntrySettled) {
-        m_startDeferredUntilEntrySettled = true;
+    if (m_startHold != StartHold::None) {
+        m_startHold = StartHold::HeldWithStartRequested;
         return;
     }
     m_started = true;

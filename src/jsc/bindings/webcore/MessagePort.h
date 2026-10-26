@@ -74,7 +74,7 @@ public:
     // nothing until the entry module has evaluated (node's ordering; a message must not run, or
     // throw, while the entry that handles it is loading). A start() requested before that is kept
     // and performed by entrySettled(). Messages stay buffered in the pipe meanwhile.
-    void holdStartUntilEntrySettled() { m_holdsStartUntilEntrySettled = true; }
+    void holdStartUntilEntrySettled() { m_startHold = StartHold::Held; }
     void entrySettled();
     // Dispatch what is queued now, on the caller's stack instead of from a drain task: close()
     // inside a handler and a peer's close do it before teardown, and a worker's hub port when its
@@ -154,8 +154,9 @@ private:
     bool m_isDispatching { false };
     bool m_closeEventDispatched { false };
     bool m_hasMessageEventListener { false };
-    bool m_holdsStartUntilEntrySettled { false };
-    bool m_startDeferredUntilEntrySettled { false };
+    // See holdStartUntilEntrySettled().
+    enum class StartHold : uint8_t { None, Held, HeldWithStartRequested };
+    StartHold m_startHold { StartHold::None };
     // Read from the GC thread: a port whose only listener is 'close' must survive
     // until that event is delivered, or the peer's close is lost to a collection.
     std::atomic<bool> m_hasCloseEventListener { false };

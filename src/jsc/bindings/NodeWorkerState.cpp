@@ -115,10 +115,11 @@ void NodeWorkerState::takeFromParent(Zig::GlobalObject& globalObject, WorkerOpti
     auto& context = *globalObject.scriptExecutionContext();
     m_tookFromParent = true;
 
-    if (auto transferred = std::exchange(options.nodePorts, std::nullopt)) {
+    if (auto transferred = std::exchange(options.nodePorts, {}); !transferred.isEmpty()) {
+        ASSERT(transferred.size() == NodePort::NodePortCount);
         for (unsigned i = 0; i < NodePort::NodePortCount; i++) {
-            if ((*transferred)[i].pipe)
-                m_ports[i] = MessagePort::entangle(context, WTF::move((*transferred)[i]));
+            if (transferred[i].pipe)
+                m_ports[i] = MessagePort::entangle(context, WTF::move(transferred[i]));
         }
 
         // Started now so that what the parent posts is delivered as soon as the entry has evaluated
