@@ -3442,7 +3442,7 @@ describe("node worker start sequence", () => {
       console.groupEnd();
       console.warn("%s", "warn");
     `;
-    const build = `void console; void process.stdout; void process.stderr; void process.stdin;`;
+    const build = `const built = [console, process.stdout, process.stderr, process.stdin];`;
     const builtAfter = await runWorker(pollute + use);
     expect(builtAfter).toEqual(await runWorker(build + pollute + use));
     expect(builtAfter.exitCode).toBe(0);

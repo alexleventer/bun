@@ -178,7 +178,7 @@ void JSMessagePortPrototype::finishCreation(VM& vm, CustomGetterSetter* nodeWork
 
     // "close" keeps its place among the own properties.
     size_t closeIndex = 0;
-    while (std::strcmp(table[closeIndex].m_key.characters(), "close"))
+    while (table[closeIndex].m_key != "close"_s)
         closeIndex++;
     Bun::reifyStaticPropertyTable(vm, JSMessagePort::info(), table.first(closeIndex), *this);
     putDirectCustomAccessor(vm, Identifier::fromString(vm, "close"_s), nodeWorkerMember, nodeCloseAttributes);

@@ -3288,9 +3288,10 @@ template<class Visitor, class T> static void visitGlobalObjectMember(Visitor& vi
 
 template<class Visitor, class T> static void visitGlobalObjectMember(Visitor& visitor, std::unique_ptr<T>& ptr)
 {
-    // The two unique_ptr members (m_builtinInternalFunctions, m_constructors) are
-    // populated in the constructor initializer list, so in steady state this is
-    // never null. The guard exists because the concurrent marker can visit a
+    // m_builtinInternalFunctions and m_constructors are populated in the constructor
+    // initializer list, so in steady state they are never null (m_nodeWorkerState is
+    // null on every global but a node:worker_threads worker's). For those two the
+    // guard exists because the concurrent marker can visit a
     // Zig::GlobalObject picked up via conservative stack scan while its own
     // IsoSubspace slot is being recycled from a previously-destroyed global whose
     // unique_ptr members were reset to null by ~unique_ptr(); until placement-new
