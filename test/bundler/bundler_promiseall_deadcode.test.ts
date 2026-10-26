@@ -92,9 +92,9 @@ describe("bundler", () => {
               return Promise.resolve().then(() => res);
             return __esmImport && start < __esmImport.at ? Promise.resolve() : undefined;
           }
-          if (from === 1) {
+          if (from > 0) {
             call = { at: ++__esmClock, outer: __esmImport };
-            return (queue = __esmQueue) ? new Promise((resolve) => queue.push(() => resolve(init(call)))) : Promise.resolve(call).then(init);
+            return (queue = __esmQueue) && from < 2 ? new Promise((resolve) => queue.push(() => resolve(init(call)))) : Promise.resolve(call).then(init);
           }
           outer = __esmImport;
           queue = __esmQueue;
@@ -173,7 +173,7 @@ describe("bundler", () => {
         await Promise.resolve();
         AsyncEntryPoint();
 
-        //# debugId=A46CF3A88F5A028464756E2164756E21
+        //# debugId=4456FB6F26F7AC0664756E2164756E21
         //# sourceMappingURL=out.js.map
         "
       `);

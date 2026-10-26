@@ -562,6 +562,10 @@ export var __callDispose = (stack, error, hasError) => {
 ";
 
 // Must stay last: the chunk hash reads runtime part indices, so nothing before it can move.
+//
+// `init(2)` is an `import()` whose promise nothing can await: the code drops it, or gives it only
+// to a `.then()` chain that it drops. That module starts a job later, not when the running wrapper
+// suspends: an `import` statement that the same job still reaches starts the module first.
 const RUNTIME_ESM_ASYNC: &str = "\
 // `__esm` for a wrapper that is an async function. `init(1)` is an `import()` of its module.
 var __esmClock = 0; // orders wrapper starts, wrapper ends and `import()` calls
@@ -579,10 +583,10 @@ export var __esmAsync = (fn, res, start, end, init) =>
       // An import cycle member runs on. A wrapper that ran before the `import()` call costs one job.
       return __esmImport && start < __esmImport.at ? Promise.resolve() : void 0;
     }
-    if (from === 1) {
+    if (from > 0) {
       call = { at: ++__esmClock, outer: __esmImport };
       // The module starts when the running code is done, not inside the `import()` call.
-      return (queue = __esmQueue)
+      return (queue = __esmQueue) && from < 2
         ? new Promise(resolve => queue.push(() => resolve(init(call))))
         : Promise.resolve(call).then(init);
     }

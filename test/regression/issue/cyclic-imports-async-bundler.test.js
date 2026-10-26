@@ -108,9 +108,9 @@ test("cyclic imports with async dependencies should generate async wrappers", as
           return Promise.resolve().then(() => res);
         return __esmImport && start < __esmImport.at ? Promise.resolve() : undefined;
       }
-      if (from === 1) {
+      if (from > 0) {
         call = { at: ++__esmClock, outer: __esmImport };
-        return (queue = __esmQueue) ? new Promise((resolve) => queue.push(() => resolve(init(call)))) : Promise.resolve(call).then(init);
+        return (queue = __esmQueue) && from < 2 ? new Promise((resolve) => queue.push(() => resolve(init(call)))) : Promise.resolve(call).then(init);
       }
       outer = __esmImport;
       queue = __esmQueue;
@@ -189,7 +189,7 @@ test("cyclic imports with async dependencies should generate async wrappers", as
     await Promise.resolve();
     AsyncEntryPoint();
 
-    //# debugId=E7CC6DE67E046E4064756E2164756E21
+    //# debugId=F8CFE4648F5AD8E864756E2164756E21
     //# sourceMappingURL=entryBuild.js.map
     "
   `);

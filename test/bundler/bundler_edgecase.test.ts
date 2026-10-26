@@ -5009,6 +5009,114 @@ describe("bundler", () => {
       `,
     },
   });
+  // The next cases: the code drops the promise of the `import()`, so nothing
+  // can await it. Its module starts in a later job, after the `import`
+  // statements that this job still reaches.
+  // two calls `import()` on one before its await, and the entry imports one
+  // right after. one runs at its place among the imports of the entry, after two.
+  itBundled("edgecase/DroppedImportCallOfALaterStaticDependency", {
+    files: {
+      "/entry.js": /* js */ `
+        import "./two.js";
+        import "./one.js";
+        console.log("entry");
+      `,
+      "/one.js": /* js */ `
+        import { v } from "./two.js";
+        console.log("one sees v =", v);
+      `,
+      "/two.js": /* js */ `
+        import("./one.js");
+        await 0;
+        export const v = ["set"].join();
+      `,
+    },
+    format: "esm",
+    run: { stdout: "one sees v = set\nentry" },
+  });
+  // The same, and two is in an import cycle with three: its `import()` call
+  // runs in its first synchronous part, before the entry reaches one.
+  itBundled("edgecase/DroppedImportCallOfALaterStaticDependencyFromImportCycle", {
+    files: {
+      "/entry.js": /* js */ `
+        import "./three.js";
+        import "./one.js";
+        console.log("entry");
+      `,
+      "/one.js": /* js */ `
+        import { v } from "./two.js";
+        console.log("one sees v =", v);
+      `,
+      "/two.js": /* js */ `
+        import "./three.js";
+        import("./one.js");
+        await 0;
+        export const v = ["set"].join();
+      `,
+      "/three.js": /* js */ `
+        import "./two.js";
+        console.log("three");
+      `,
+    },
+    format: "esm",
+    run: { stdout: "three\none sees v = set\nentry" },
+  });
+  // Only the callbacks of a `.then()` chain get the promise, and the code
+  // drops the result of the chain: nothing can await this `import()` either.
+  itBundled("edgecase/DroppedImportCallChainOfALaterStaticDependencyFromImportCycle", {
+    files: {
+      "/entry.js": /* js */ `
+        import "./three.js";
+        import "./one.js";
+        console.log("entry");
+      `,
+      "/one.js": /* js */ `
+        import { v } from "./two.js";
+        console.log("one sees v =", v);
+      `,
+      "/two.js": /* js */ `
+        import "./three.js";
+        import("./one.js").then(() => console.log("one loaded")).catch(() => {});
+        await 0;
+        export const v = ["set"].join();
+      `,
+      "/three.js": /* js */ `
+        import "./two.js";
+        console.log("three");
+      `,
+    },
+    format: "esm",
+    run: { stdout: "three\none sees v = set\nentry\none loaded" },
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("init_one(2)");
+    },
+  });
+  // An awaited `import()` is not dropped, also when its names are bound to
+  // the exports and only the load is left. b imports a back and does not wait.
+  itBundled("edgecase/AwaitedImportCallWithBoundNamesIsNotDropped", {
+    files: {
+      "/entry.js": /* js */ `
+        import "./a.js";
+        console.log("entry");
+      `,
+      "/a.js": /* js */ `
+        export const value = ["V"].join();
+        {
+          const { helper } = await import("./b.js");
+          console.log("a got", helper);
+        }
+      `,
+      "/b.js": /* js */ `
+        import { value } from "./a.js";
+        export const helper = value + "!";
+      `,
+    },
+    format: "esm",
+    run: { stdout: "a got V!\nentry" },
+    onAfterBundle(api) {
+      api.expectFile("/out.js").toContain("await init_b(1);");
+    },
+  });
   // router awaits the `import()` of home, home imports store, and app imports
   // store after router. store does not wait for router, so nothing hangs.
   itBundled("edgecase/AwaitedImportCallSharesDependencyWithLaterImport", {

@@ -1584,6 +1584,11 @@ pub enum ExprFlag {
     HasNonOptionalChainParent,
     ExprResultIsUnused,
     IsFollowedByOf,
+    /// With `ExprResultIsUnused`: the expression is the operand of an `await` whose value is unused.
+    ExprResultIsAwaited,
+    /// The value is a promise that only the callbacks of a `.then()`, `.catch()` or `.finally()`
+    /// chain get, and the code drops the result of that chain.
+    PromiseIsDropped,
 }
 
 pub(crate) type ExprFlagSet = enumset::EnumSet<ExprFlag>;
@@ -2788,10 +2793,14 @@ pub(crate) mod __gated_printer {
                 let namespace_unused = record.flags.contains(ImportRecordFlags::NAMESPACE_UNUSED);
 
                 // Internal "import()" of async ESM: `init_foo(1)`, the 1 marks the call for `__esmAsync`.
+                // `init_foo(2)` when the code drops the promise: nothing can await that `import()`.
                 if record.kind == ImportKind::Dynamic && meta.is_wrapper_async {
+                    let promise_is_dropped = flags.contains(ExprFlag::PromiseIsDropped)
+                        || (flags.contains(ExprFlag::ExprResultIsUnused)
+                            && !flags.contains(ExprFlag::ExprResultIsAwaited));
                     self.print_space_before_identifier();
                     self.print_symbol(meta.wrapper_ref);
-                    self.print(b"(1)");
+                    self.print(if promise_is_dropped { b"(2)" } else { b"(1)" });
                     if meta.exports_ref.is_valid() {
                         let _ = self.print_dot_then_prefix();
                         self.print_space_before_identifier();
@@ -3499,6 +3508,17 @@ pub(crate) mod __gated_printer {
                         wrap = true;
                     }
 
+                    if (flags.contains(ExprFlag::PromiseIsDropped)
+                        || (flags.contains(ExprFlag::ExprResultIsUnused)
+                            && !flags.contains(ExprFlag::ExprResultIsAwaited)))
+                        && e.optional_chain.is_none()
+                        && let ExprData::EDot(dot) = e.target.data
+                        && dot.optional_chain.is_none()
+                        && matches!(&*dot.name, b"then" | b"catch" | b"finally")
+                    {
+                        target_flags.insert(ExprFlag::PromiseIsDropped);
+                    }
+
                     let has_pure_comment = e.can_be_unwrapped_if_unused == E::CallUnwrap::IfUnused
                         && self.options.print_dce_annotations;
                     if has_pure_comment && level.gte(Level::Postfix) {
@@ -3705,7 +3725,9 @@ pub(crate) mod __gated_printer {
                         }
                         flags.remove(ExprFlag::HasNonOptionalChainParent);
                     }
-                    flags &= ExprFlag::HasNonOptionalChainParent | ExprFlag::ForbidCall;
+                    flags &= ExprFlag::HasNonOptionalChainParent
+                        | ExprFlag::ForbidCall
+                        | ExprFlag::PromiseIsDropped;
 
                     self.print_expr(e.target, Level::Postfix, flags);
 
@@ -6731,7 +6753,7 @@ pub(crate) mod __gated_printer {
                 self.print_expr(
                     e.value,
                     Level::Prefix.sub(1),
-                    ExprFlag::expr_result_is_unused(),
+                    ExprFlag::ExprResultIsUnused | ExprFlag::ExprResultIsAwaited,
                 );
             } else {
                 self.print_expr(value, Level::Lowest, ExprFlag::expr_result_is_unused());
