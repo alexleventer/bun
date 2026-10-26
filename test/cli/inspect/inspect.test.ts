@@ -604,9 +604,13 @@ test("error.stack doesnt lose frames", () => {
   expect(no.split("\n").slice(0, -2).join("\n").trim()).toBe(yes.split("\n").slice(0, -2).join("\n").trim());
 });
 
-test("LifecycleReporter.getModuleGraph reports an empty argv when process.argv isn't an array", async () => {
-  await using child = spawn({
-    cmd: [bunExe(), "--inspect=ws://127.0.0.1:0/", "-e", "setInterval(() => {}, 1000);"],
+/**
+ * Runs `script` in a bun that has an inspector. `send` sends one protocol message and resolves to
+ * the reply, or to an error when the inspector closes the socket.
+ */
+async function inspect(script: string) {
+  const child = spawn({
+    cmd: [bunExe(), "--inspect=ws://127.0.0.1:0/", "-e", script],
     env: bunEnv,
     stdout: "ignore",
     stderr: "pipe",
@@ -624,7 +628,7 @@ test("LifecycleReporter.getModuleGraph reports an empty argv when process.argv i
 
   type Reply = { result?: any; error?: { message: string } };
   const pending = new Map<number, (reply: Reply) => void>();
-  // A crash closes the socket. Resolve instead of rejecting so the failure shows up in the snapshot below.
+  // A crash closes the socket. Resolve instead of rejecting so the failure shows up in what the test compares.
   const closed = Promise.withResolvers<Reply>();
   const opened = Promise.withResolvers<Reply>();
   const webSocket = new WebSocket(url);
@@ -648,6 +652,21 @@ test("LifecycleReporter.getModuleGraph reports an empty argv when process.argv i
 
   expect(await Promise.race([opened.promise, closed.promise])).toEqual({});
 
+  return {
+    child,
+    send,
+    async [Symbol.asyncDispose]() {
+      webSocket.close();
+      child.kill();
+      await child.exited;
+    },
+  };
+}
+
+test("LifecycleReporter.getModuleGraph reports an empty argv when process.argv isn't an array", async () => {
+  await using session = await inspect("setInterval(() => {}, 1000);");
+  const { child, send } = session;
+
   const argv: Record<string, unknown> = {};
   for (const expression of ["undefined", "0", `"abc"`, "{}", `["a", "b"]`]) {
     const assigned = await send("Runtime.evaluate", { expression: `process.argv = ${expression}` });
@@ -669,5 +688,30 @@ test("LifecycleReporter.getModuleGraph reports an empty argv when process.argv i
   `);
 
   expect(child.exitCode).toBe(null);
-  webSocket.close();
+});
+
+// queryHolders() of the console answers from a collection that reports each reference it follows.
+// A Map and a Set keep their entries in a table that is a cell of its own, and so does a bound
+// function with its arguments past the third: the table has to report what it holds.
+test("queryHolders() finds the Map, the Set and the bound function that hold an object", async () => {
+  await using session = await inspect(`
+    globalThis.target = {};
+    globalThis.holders = {
+      object: { target },
+      mapOfKeys: new Map([[target, 1]]),
+      mapOfValues: new Map([["key", target]]),
+      set: new Set([target]),
+      bound: function () {}.bind(null, 1, 2, 3, target),
+    };
+    globalThis.nameOf = holder => Object.keys(holders).find(name => holders[name] === holder) ?? "other";
+    delete globalThis.target;
+    setInterval(() => {}, 1000);
+  `);
+
+  const reply = await session.send("Runtime.evaluate", {
+    expression: "queryHolders(holders.object.target).map(nameOf).sort()",
+    includeCommandLineAPI: true,
+    returnByValue: true,
+  });
+  expect(reply.error ?? reply.result.result.value).toEqual(["bound", "mapOfKeys", "mapOfValues", "object", "set"]);
 });

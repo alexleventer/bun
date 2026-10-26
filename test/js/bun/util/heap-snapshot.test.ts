@@ -1,6 +1,6 @@
 import { estimateShallowMemoryUsageOf, heapStats } from "bun:jsc";
 import { describe, expect, it } from "bun:test";
-import { bunEnv, bunExe } from "harness";
+import { bunEnv, bunExe, isASAN } from "harness";
 import path from "node:path";
 import { parseHeapSnapshot, summarizeByType } from "./heap";
 
@@ -223,6 +223,75 @@ describe("CommonJS Module cached slots are visible in heap snapshots", () => {
     expect(targetsByName["children"]).toContain("Array");
     expect(exitCode).toBe(0);
   });
+});
+
+// A Map and a Set keep their entries in a table that is a cell of its own, and so do a bound
+// function and a timer with their arguments past the ones they have fields for. The snapshot has
+// to say that this cell references them: without that edge a leak through a Map has no retainer.
+describe.concurrent("What a Map, a Set, a bound function and a timer hold is reachable from a root", () => {
+  it.each(["Inspector", "GCDebugging", "V8"])("in the %s format", async format => {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), path.join(__dirname, "heap-snapshot-retainers-fixture.ts"), format],
+      env: bunEnv,
+      stderr: "pipe",
+    });
+
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toEqual({
+      ArrayElement: true,
+      MapKey: true,
+      MapValue: true,
+      SetMember: true,
+      BoundArgument: true,
+      TimerArgument: true,
+      // Still held: by the table an iterator was created on, which the Map has since replaced.
+      ValueInReplacedTable: true,
+      // Held by a scope slot that has no name.
+      ShadowedParameter: true,
+      // Removed, and no iterator has the table: nothing holds them.
+      DeletedValue: false,
+      ClearedMember: false,
+    });
+    expect(exitCode).toBe(0);
+  });
+});
+
+// ASAN's allocator can be told to refuse a large allocation. That stands in for a heap with more
+// edges than a snapshot can hold, which takes gigabytes to build.
+it.skipIf(!isASAN)("a snapshot that cannot hold its edges throws", async () => {
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `
+        import { generateHeapSnapshotForDebugging } from "bun:jsc";
+        // 400,000 edges: 16 MB of them in the snapshot.
+        const shared = {};
+        globalThis.arrays = Array.from({ length: 40 }, () => new Array(10000).fill(shared));
+        for (const snapshot of [generateHeapSnapshotForDebugging, () => Bun.generateHeapSnapshot()]) {
+          try {
+            console.log("returned", typeof snapshot());
+          } catch (e) {
+            console.log("threw", e.name, e.message);
+          }
+        }
+      `,
+    ],
+    env: {
+      ...bunEnv,
+      Malloc: "1",
+      ASAN_OPTIONS: [bunEnv.ASAN_OPTIONS, "allocator_may_return_null=1", "max_allocation_size_mb=8", "detect_leaks=0"]
+        .filter(Boolean)
+        .join(":"),
+    },
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+  expect(stdout).toBe("threw RangeError Out of memory\nthrew RangeError Out of memory\n");
+  expect(exitCode).toBe(0);
 });
 
 it("console.takeHeapSnapshot() can be called repeatedly", async () => {
