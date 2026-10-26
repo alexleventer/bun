@@ -153,7 +153,7 @@ static __attribute__((minsize)) JSC::EncodedJSValue constructWorker(JSGlobalObje
     auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
     if (callFrame->argumentCount() < 1) [[unlikely]]
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
-    auto* context = constructorGlobalObject.scriptExecutionContext();
+    auto* context = constructorGlobalObject.currentScriptExecutionContext();
     if (!context) [[unlikely]]
         return throwConstructorScriptExecutionContextUnavailableError(*lexicalGlobalObject, throwScope, "Worker"_s);
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
