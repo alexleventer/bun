@@ -3,16 +3,11 @@
 // control MessagePort to it, and it routes each message to the destination's port.
 // Delivery results are reported back through a SharedArrayBuffer + Atomics.
 //
-// Differences from node: thread info and this thread's port to the hub come from the native
-// binding (Bun assigns threadId differently, and a worker's port is taken by its native start
-// sequence); createMainThreadPort is split into createMessagingChannel (before `new Worker`) +
-// registerMainThreadPort (after the threadId exists); and the `workerMessage` listeners are invoked
-// directly because Bun's process.emit cannot report no-listeners or a throwing listener (see
-// receiveMessageFromWorker).
-//
-// A worker does not evaluate this module until it sends, or until the first message for it
-// arrives: the native listener on its port (NodeWorkerState.cpp) requires this module then and
-// hands that message to the listener attached below.
+// Differences from node: thread info comes from the native binding (Bun assigns threadId
+// differently); createMainThreadPort is split into createMessagingChannel (before
+// `new Worker`) + registerMainThreadPort (after the threadId exists); and the
+// `workerMessage` listeners are invoked directly because Bun's process.emit cannot
+// report no-listeners or a throwing listener (see receiveMessageFromWorker).
 
 const messageTypes = {
   REGISTER_MAIN_THREAD_PORT: "registerMainThreadPort",
@@ -26,27 +21,24 @@ const {
   1: isMainThread,
   // The intrinsic constructor, not globalThis.MessageChannel, which user code can replace (#40268).
   2: MessageChannel,
-  // Only in a worker that node:worker_threads' Worker made; undefined on the main thread and in a
-  // raw Web Worker, which is not connected to the hub.
+  // Only in a worker of node:worker_threads: its port to the hub. A raw Web Worker is not connected to the hub.
   3: mainThreadPort,
+  // Puts a 'message' listener on that port in place of the one the worker's native start sequence left there (NodeWorkerState).
+  4: listenOnMainThreadPort,
 } = $cpp("Worker.cpp", "createNodeWorkerMessagingBinding") as [
   number,
   boolean,
   typeof globalThis.MessageChannel,
   import("node:worker_threads").MessagePort | undefined,
+  ((listener: (event: MessageEvent) => void) => void) | undefined,
 ];
 
-// Only the main thread (the hub) has these.
+// Only the main thread (the hub) has one.
 // SafeMap: its prototype is a frozen null-proto snapshot taken at bootstrap, so the
 // cross-thread routing table can't be broken by user code replacing Map.prototype.
-function hubMap<K, V>(): Map<K, V> {
-  return isMainThread ? new (require("internal/primordials").SafeMap)() : undefined!;
-}
-const threadsPorts = hubMap<number, import("node:worker_threads").MessagePort>();
-// What the hub routed to a thread and has seen no reply to, by destination. A thread can exit
-// with such a message still in its port, or on its way there, and then nothing on that thread
-// answers it: the hub does, when it sees the thread's port close (failUnanswered).
-const unansweredByThread = hubMap<number, SharedArrayBuffer[]>();
+const threadsPorts: Map<number, import("node:worker_threads").MessagePort> = isMainThread
+  ? new (require("internal/primordials").SafeMap)()
+  : undefined!;
 
 // SharedArrayBuffer must always be Int32, so it's * 4.
 // One slot for the operation status (performing / performed) and one for the result.
@@ -77,7 +69,6 @@ function handleMessageFromThread(message) {
       // never ran); otherwise the stale entry lingers in the hub forever.
       port.on("close", () => {
         if (threadsPorts.get(threadId) === port) threadsPorts.delete(threadId);
-        failUnanswered(threadId);
       });
 
       // Never block the thread on this port.
@@ -90,7 +81,6 @@ function handleMessageFromThread(message) {
         port.close();
         threadsPorts.delete(message.threadId);
       }
-      failUnanswered(message.threadId);
       break;
     }
     case messageTypes.SEND_MESSAGE_TO_WORKER: {
@@ -98,20 +88,6 @@ function handleMessageFromThread(message) {
       sendMessageToWorker(source, destination, value, transferList, memory);
       break;
     }
-  }
-}
-
-// The thread is gone: it has no `workerMessage` listeners any more.
-function failUnanswered(threadId: number) {
-  const unanswered = unansweredByThread.get(threadId);
-  if (!unanswered) return;
-  unansweredByThread.delete(threadId);
-  for (let i = 0; i < unanswered.length; i++) {
-    const status = new Int32Array(unanswered[i]);
-    if (Atomics.load(status, WORKER_MESSAGING_STATUS_INDEX) !== 0) continue;
-    Atomics.store(status, WORKER_MESSAGING_RESULT_INDEX, WORKER_MESSAGING_RESULT_NO_LISTENERS);
-    Atomics.store(status, WORKER_MESSAGING_STATUS_INDEX, 1);
-    Atomics.notify(status, WORKER_MESSAGING_STATUS_INDEX, 1);
   }
 }
 
@@ -151,20 +127,6 @@ function sendMessageToWorker(source, destination, value, transferList, memory) {
     },
     transferList,
   );
-
-  let unanswered = unansweredByThread.get(destination);
-  if (!unanswered) {
-    unansweredByThread.set(destination, (unanswered = []));
-  } else if (unanswered.length >= 64) {
-    // Most have a reply by now. Keep the rest.
-    let kept = 0;
-    for (let i = 0; i < unanswered.length; i++) {
-      if (Atomics.load(new Int32Array(unanswered[i]), WORKER_MESSAGING_STATUS_INDEX) === 0)
-        unanswered[kept++] = unanswered[i];
-    }
-    unanswered.length = kept;
-  }
-  $arrayPush(unanswered, memory);
 }
 
 function receiveMessageFromWorker(source, value, memory) {
@@ -238,17 +200,8 @@ function destroyMainThreadPort(threadId: number) {
   }
 }
 
-// Deliveries from the main-thread hub wait until the entry module has finished evaluating,
-// matching node's bootstrap -> synchronous CJS main ordering: a routed message must not observe
-// "no listeners" while the entry that registers them is still loading. The port does that
-// natively (MessagePort::holdStartUntilEntrySettled), so what arrives here is handled at once.
-if (mainThreadPort) {
-  // addEventListener, not on(): the emitter methods belong to node:worker_threads, which this
-  // thread may never load.
-  mainThreadPort.addEventListener("message", event => handleMessageFromMainThread(event.data));
-  // Never block the process on this port.
-  mainThreadPort.unref();
-}
+// As in node, a worker gets nothing from the hub before its entry module has evaluated: the port holds its start until then (MessagePort::holdStartUntilEntrySettled).
+if (listenOnMainThreadPort) listenOnMainThreadPort(event => handleMessageFromMainThread(event.data));
 
 async function postMessageToThread(threadId, value, transferList, timeout) {
   if (typeof transferList === "number" && typeof timeout === "undefined") {

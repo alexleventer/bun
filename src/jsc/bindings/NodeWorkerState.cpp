@@ -2,23 +2,25 @@
 #include "NodeWorkerState.h"
 
 #include "AddEventListenerOptions.h"
-#include "BunClientData.h"
-#include "BunProcess.h"
 #include "Event.h"
 #include "EventListener.h"
 #include "EventNames.h"
 #include "InternalModuleRegistry.h"
+#include "JSBuffer.h"
 #include "JSMessagePort.h"
 #include "MessagePortPipe.h"
 #include "ScriptExecutionContext.h"
-#include "SerializedScriptValue.h"
+#include "StructuredSerializeOptions.h"
 #include "WebCoreJSBuiltins.h"
+#include "Worker.h"
 #include "ZigGlobalObject.h"
-#include <JavaScriptCore/CustomGetterSetter.h>
+#include <JavaScriptCore/DeferTermination.h>
 #include <JavaScriptCore/JSArray.h>
+#include <JavaScriptCore/JSGenericTypedArrayViewInlines.h>
 #include <JavaScriptCore/JSMap.h>
-#include <wtf/SetForScope.h>
 #include <wtf/TZoneMallocInlines.h>
+
+extern "C" void Bun__ConsoleObject__useWorkerStdio(JSC::JSGlobalObject*);
 
 namespace Bun {
 
@@ -30,16 +32,11 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(NodeWorkerState);
 NodeWorkerState::NodeWorkerState() = default;
 NodeWorkerState::~NodeWorkerState() = default;
 
-// Stands on a port for as long as the worker has not built what receives that port's messages:
-// process.stdin (the parent writes to worker.stdin) or internal/worker/messaging (a thread calls
-// postMessageToThread). The first message builds it. What is built takes this listener off the
-// port (stopListeningForArrival) and attaches its own, which that message is then handed to. A
-// worker that gets no such message builds neither.
-class NodeWorkerPortArrivalListener final : public EventListener {
+class NodeWorkerPortListener final : public EventListener {
 public:
-    static Ref<NodeWorkerPortArrivalListener> create(NodeWorkerState::NodePort port)
+    static Ref<NodeWorkerPortListener> create(NodeWorkerState::NodePort port)
     {
-        return adoptRef(*new NodeWorkerPortArrivalListener(port));
+        return adoptRef(*new NodeWorkerPortListener(port));
     }
 
     bool operator==(const EventListener& other) const final { return this == &other; }
@@ -48,37 +45,14 @@ public:
     {
         auto* globalObject = defaultGlobalObject(context.globalObject());
         auto* state = globalObject ? globalObject->nodeWorkerState() : nullptr;
-        RefPtr port = state ? state->port(m_port) : nullptr;
-        if (!port)
+        if (!state)
             return;
         Ref protectedThis { *this };
-        EventTarget& target = *port;
-
-        auto& vm = globalObject->vm();
-        auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-        if (m_port == NodeWorkerState::NodePort::Stdin)
-            state->stdioStream(*globalObject, 0);
-        else
-            globalObject->internalModuleRegistry()->requireId(globalObject, vm, InternalModuleRegistry::Field::InternalWorkerMessaging);
-        if (auto* exception = scope.exception()) [[unlikely]] {
-            if (!vm.isTerminationException(exception)) {
-                scope.clearException();
-                Zig::GlobalObject::reportUncaughtExceptionAtEventLoop(globalObject, exception);
-            }
-            return;
-        }
-
-        // A listener added during a dispatch does not see the event being dispatched.
-        EventListenerVector listeners = target.eventListeners(eventNames().messageEvent);
-        for (auto& registered : listeners) {
-            if (registered->wasRemoved())
-                continue;
-            registered->callback().handleEvent(context, event);
-        }
+        state->didReceiveMessage(*globalObject, m_port, context, event);
     }
 
 private:
-    explicit NodeWorkerPortArrivalListener(NodeWorkerState::NodePort port)
+    explicit NodeWorkerPortListener(NodeWorkerState::NodePort port)
         : EventListener(NativeEventListenerType)
         , m_port(port)
     {
@@ -87,86 +61,63 @@ private:
     const NodeWorkerState::NodePort m_port;
 };
 
-static void listenForArrival(Zig::GlobalObject& globalObject, MessagePort& port, NodeWorkerState::NodePort which)
+void NodeWorkerState::listen(NodePort which)
 {
-    // Unref before listening: a 'message' listener refs the loop, and neither an unread stdin nor the
-    // hub port may keep the thread alive.
-    port.jsUnref(&globalObject);
-    static_cast<EventTarget&>(port).addEventListener(eventNames().messageEvent, NodeWorkerPortArrivalListener::create(which), {});
+    ASSERT(!m_listeners[which]);
+    Ref listener = NodeWorkerPortListener::create(which);
+    m_listeners[which] = listener.copyRef();
+    static_cast<EventTarget&>(*m_ports[which]).addEventListener(eventNames().messageEvent, WTF::move(listener), {});
 }
 
-void NodeWorkerState::stopListeningForArrival(NodePort which)
+void NodeWorkerState::stopListening(NodePort which)
 {
-    RefPtr port = m_ports[which];
-    if (!port)
-        return;
-    EventTarget& target = *port;
-    EventListenerVector listeners = target.eventListeners(eventNames().messageEvent);
-    for (auto& registered : listeners) {
-        if (registered->callback().type() == EventListener::NativeEventListenerType)
-            target.removeEventListener(eventNames().messageEvent, registered->callback(), {});
-    }
+    if (RefPtr listener = std::exchange(m_listeners[which], nullptr))
+        static_cast<EventTarget&>(*m_ports[which]).removeEventListener(eventNames().messageEvent, *listener, {});
 }
 
 void NodeWorkerState::takeFromParent(Zig::GlobalObject& globalObject, WorkerOptions& options)
 {
     auto& vm = globalObject.vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    auto& context = *globalObject.scriptExecutionContext();
-    m_tookFromParent = true;
+    ASSERT(!globalObject.hasProcessObject());
 
-    if (auto transferred = std::exchange(options.nodePorts, {}); !transferred.isEmpty()) {
-        ASSERT(transferred.size() == NodePort::NodePortCount);
+    auto transferred = std::exchange(options.nodePorts, {});
+    ASSERT(transferred.size() == NodePort::NodePortCount);
+    if (transferred.size() == NodePort::NodePortCount) [[likely]] {
+        auto& context = *globalObject.scriptExecutionContext();
         for (unsigned i = 0; i < NodePort::NodePortCount; i++) {
             if (transferred[i].pipe)
                 m_ports[i] = MessagePort::entangle(context, WTF::move(transferred[i]));
         }
 
-        // Started now so that what the parent posts is delivered as soon as the entry has evaluated
-        // and a 'message' listener exists. Without a listener the port holds no loop ref.
+        // node starts parentPort for the worker. It delivers once the entry has evaluated and a 'message' listener exists.
         auto& parent = *m_ports[NodePort::Parent];
         parent.holdStartUntilEntrySettled();
         parent.start();
 
+        // Unref'd before the listener is added: neither the hub port nor an unread stdin keeps the thread alive.
         auto& hub = *m_ports[NodePort::Hub];
         hub.holdStartUntilEntrySettled();
-        listenForArrival(globalObject, hub, NodePort::Hub);
+        hub.jsUnref(&globalObject);
+        listen(NodePort::Hub);
+        if (RefPtr stdinPort = m_ports[NodePort::Stdin]) {
+            stdinPort->jsUnref(&globalObject);
+            listen(NodePort::Stdin);
+        }
 
-        // The parent's write to worker.stdin completes when the worker's reader acks it, whether
-        // or not the worker ever reads process.stdin.
-        if (auto& stdinPort = m_ports[NodePort::Stdin])
-            listenForArrival(globalObject, *stdinPort, NodePort::Stdin);
+        Bun__ConsoleObject__useWorkerStdio(&globalObject);
 
-        // `process` normally does not exist yet and installs these when it is made.
-        if (globalObject.hasProcessObject())
-            globalObject.processObject()->installNodeWorkerStdioFlushListeners(vm);
-
-        // The process.nextTick callbacks that the entry queues run after the microtasks it queues
-        // (Node's order for an ES module entry). The global arms a one-shot hook that would run
-        // them first (ZigGlobalObject.cpp).
+        // Keeps the order of 1.4: an entry's process.nextTick callbacks run after its microtasks. Node does that for an ES module entry and runs them first for a CommonJS one.
         vm.setOnEachMicrotaskTick(nullptr);
     }
 
-    // Everything the parent transferred is entangled here even if the worker never reads workerData:
-    // its peers see 'close' when this thread exits.
-    if (RefPtr serialized = WTF::move(options.workerDataAndEnvironmentData)) {
-        auto ports = MessagePort::entanglePorts(context, WTF::move(options.dataMessagePorts));
-        JSValue deserialized = serialized->deserialize(globalObject, &globalObject, WTF::move(ports));
-        RETURN_IF_EXCEPTION(scope, );
-        // Always an Array of length 2, from the constructor in JSWorker.cpp.
-        if (auto* pair = dynamicDowncast<JSArray>(deserialized)) {
-            ASSERT(pair->length() == 2 && pair->canGetIndexQuickly(0u) && pair->canGetIndexQuickly(1u));
-            m_workerData.set(vm, &globalObject, pair->getIndexQuickly(0));
-            // Workers that this one starts inherit it, whether or not node:worker_threads is loaded here.
-            if (auto* environmentData = dynamicDowncast<JSMap>(pair->getIndexQuickly(1)))
-                globalObject.setNodeWorkerEnvironmentData(environmentData);
-        }
-    }
-
-    if (options.workerDataHasJSTransferables) {
-        scope.release();
-        globalObject.internalModuleRegistry()->requireId(&globalObject, vm, InternalModuleRegistry::Field::NodeWorkerThreads);
-    }
+    JSMap* environmentData = nullptr;
+    JSValue workerData = takeWorkerDataFromParent(globalObject, options, environmentData);
+    RETURN_IF_EXCEPTION(scope, );
+    if (workerData)
+        m_workerData.set(vm, &globalObject, workerData);
+    if (environmentData)
+        globalObject.setNodeWorkerEnvironmentData(environmentData);
 }
 
 void NodeWorkerState::entryDidSettle(Zig::GlobalObject& globalObject)
@@ -174,7 +125,6 @@ void NodeWorkerState::entryDidSettle(Zig::GlobalObject& globalObject)
     if (std::exchange(m_entrySettled, true))
         return;
 
-    // parentPort starts delivering now (whatever the parent posted meanwhile is buffered in the pipe).
     if (RefPtr parent = m_ports[NodePort::Parent])
         parent->entrySettled();
 
@@ -185,10 +135,7 @@ void NodeWorkerState::entryDidSettle(Zig::GlobalObject& globalObject)
     if (!MessagePortPipe::queuedCount(hub->pipe()->state(hub->side())))
         return;
 
-    // What other threads sent with postMessageToThread() while the entry was loading is answered on
-    // this stack, not by the loop: an entry that failed is about to stop the worker, and each
-    // sender is waiting for its reply. A failed entry can leave its exception pending here; the
-    // replies cannot observe it and shutdown reports it either way.
+    // An entry that failed is about to stop the worker, so what postMessageToThread() sent meanwhile is answered on this stack and not by the loop.
     auto& vm = globalObject.vm();
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
     CLEAR_IF_EXCEPTION(scope);
@@ -198,112 +145,182 @@ void NodeWorkerState::entryDidSettle(Zig::GlobalObject& globalObject)
     CLEAR_IF_EXCEPTION(scope);
 }
 
+void NodeWorkerState::didReceiveMessage(Zig::GlobalObject& globalObject, NodePort which, ScriptExecutionContext& context, Event& event)
+{
+    RefPtr port = m_ports[which];
+    if (which == NodePort::Stdout || which == NodePort::Stderr) {
+        auto& queue = m_consoleQueues[which - 1];
+        if (!queue.isAwaitingAck)
+            return;
+        if (queue.waiting.isEmpty()) {
+            queue.isAwaitingAck = false;
+            port->jsUnref(&globalObject);
+            return;
+        }
+        auto waiting = std::exchange(queue.waiting, {});
+        postConsoleOutput(globalObject, which, waiting.span());
+        return;
+    }
+
+    auto& vm = globalObject.vm();
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    {
+        // A termination in the middle of the build would leave the port with no reader.
+        DeferTerminationForAWhile deferTermination { vm };
+        if (which == NodePort::Stdin)
+            stdioStream(globalObject, 0);
+        else
+            globalObject.internalModuleRegistry()->requireId(&globalObject, vm, InternalModuleRegistry::Field::InternalWorkerMessaging);
+    }
+    if (auto* exception = scope.exception()) [[unlikely]] {
+        if (!vm.isTerminationException(exception)) {
+            scope.clearException();
+            Zig::GlobalObject::reportUncaughtExceptionAtEventLoop(&globalObject, exception);
+        }
+        return;
+    }
+    if (m_listeners[which]) [[unlikely]]
+        return;
+
+    // What was built listens in this object's place, and a listener added during a dispatch does not get the event being dispatched.
+    EventListenerVector listeners = static_cast<EventTarget&>(*port).eventListeners(eventNames().messageEvent);
+    for (auto& registered : listeners) {
+        if (!registered->wasRemoved())
+            registered->callback().handleEvent(context, event);
+    }
+}
+
 JSValue NodeWorkerState::stdioStream(Zig::GlobalObject& globalObject, unsigned fd)
 {
-    ASSERT(fd < 3 && hasChannels());
+    ASSERT(fd < 3);
     if (auto* stream = m_stdioStreams[fd].get())
         return stream;
 
     auto& vm = globalObject.vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
     RefPtr port = m_ports[fd];
+    ASSERT(port || !fd);
+    if (fd && !port) [[unlikely]]
+        return jsUndefined();
 
-    auto* build = JSFunction::create(vm, &globalObject, processObjectInternalsGetNodeWorkerStdioStreamCodeGenerator(vm), &globalObject);
-    MarkedArgumentBuffer args;
-    args.append(jsNumber(fd));
-    args.append(port ? toJS(&globalObject, &globalObject, *port) : jsUndefined());
-    JSValue result = JSC::profiledCall(&globalObject, ProfilingReason::API, build, JSC::getCallData(build), globalObject.globalThis(), args);
+    // The stream has the port from here on, so what the console holds for it goes out first.
+    if (fd) {
+        stopListening(static_cast<NodePort>(fd));
+        releaseConsoleQueue(globalObject, fd);
+    }
+
+    JSValue result;
+    {
+        // A termination (node:vm's timeout) in the middle of the build would leave half of a stream on the port.
+        DeferTerminationForAWhile deferTermination { vm };
+        auto* build = JSFunction::create(vm, &globalObject, processObjectInternalsGetNodeWorkerStdioStreamCodeGenerator(vm), &globalObject);
+        MarkedArgumentBuffer args;
+        args.append(jsNumber(fd));
+        args.append(port ? toJS(&globalObject, &globalObject, *port) : jsUndefined());
+        result = JSC::profiledCall(&globalObject, ProfilingReason::API, build, JSC::getCallData(build), globalObject.globalThis(), args);
+    }
     RETURN_IF_EXCEPTION(scope, {});
 
     JSObject* stream = nullptr;
-    if (fd == 0) {
+    if (!fd) {
         stream = asObject(result);
-        // The reader listens for itself from here on.
-        stopListeningForArrival(NodePort::Stdin);
+        stopListening(NodePort::Stdin);
     } else {
-        // [stream, flush], as getStdioWriteStream returns [stream, sink].
-        auto* pair = uncheckedDowncast<JSArray>(result);
-        stream = asObject(pair->getIndexQuickly(0));
-        m_stdioFlush[fd - 1].set(vm, &globalObject, asObject(pair->getIndexQuickly(1)));
+        auto* built = uncheckedDowncast<JSArray>(result);
+        stream = asObject(built->getIndexQuickly(0));
+        m_stdioFlush[fd - 1].set(vm, &globalObject, asObject(built->getIndexQuickly(1)));
+        m_consoleWrite[fd - 1].set(vm, &globalObject, asObject(built->getIndexQuickly(2)));
     }
     m_stdioStreams[fd].set(vm, &globalObject, stream);
     return stream;
 }
 
-void NodeWorkerState::flushStdio(Zig::GlobalObject& globalObject, unsigned fd)
+void NodeWorkerState::postConsoleOutput(Zig::GlobalObject& globalObject, unsigned fd, std::span<const uint8_t> bytes)
+{
+    auto& vm = globalObject.vm();
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    RefPtr port = m_ports[fd];
+
+    // The reader (makePortReadable in internal/worker/stdio) takes an array of chunks.
+    if (auto* chunk = JSUint8Array::createUninitialized(&globalObject, globalObject.typedArrayStructure(TypeUint8, false), bytes.size())) [[likely]] {
+        memcpySpan(chunk->typedSpan(), bytes);
+        MarkedArgumentBuffer chunks;
+        chunks.append(chunk);
+        if (JSArray* payload = constructArray(&globalObject, static_cast<ArrayAllocationProfile*>(nullptr), chunks))
+            (void)port->postMessage(globalObject, payload, {});
+    }
+    // Out of memory, or the port is gone: a console call does not throw for that.
+    if (scope.exception()) [[unlikely]]
+        (void)scope.tryClearException();
+}
+
+void NodeWorkerState::releaseConsoleQueue(Zig::GlobalObject& globalObject, unsigned fd)
+{
+    auto& queue = m_consoleQueues[fd - 1];
+    if (auto waiting = std::exchange(queue.waiting, {}); !waiting.isEmpty())
+        postConsoleOutput(globalObject, fd, waiting.span());
+    if (std::exchange(queue.isAwaitingAck, false))
+        m_ports[fd]->jsUnref(&globalObject);
+}
+
+void NodeWorkerState::writeConsole(Zig::GlobalObject& globalObject, unsigned fd, std::span<const uint8_t> bytes)
 {
     ASSERT(fd == 1 || fd == 2);
-    JSObject* flush = m_stdioFlush[fd - 1].get();
-    if (!flush)
+    if (bytes.empty())
         return;
-    MarkedArgumentBuffer args;
-    JSC::profiledCall(&globalObject, ProfilingReason::API, flush, JSC::getCallData(flush), jsUndefined(), args);
+
+    if (JSObject* write = m_consoleWrite[fd - 1].get()) {
+        auto& vm = globalObject.vm();
+        auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+        if (auto* chunk = createBuffer(&globalObject, bytes)) {
+            MarkedArgumentBuffer args;
+            args.append(chunk);
+            JSC::profiledCall(&globalObject, ProfilingReason::API, write, JSC::getCallData(write), jsUndefined(), args);
+        }
+        if (scope.exception()) [[unlikely]]
+            (void)scope.tryClearException();
+        return;
+    }
+
+    RefPtr port = m_ports[fd];
+    if (!port) [[unlikely]]
+        return;
+    auto& queue = m_consoleQueues[fd - 1];
+    if (queue.isAwaitingAck) {
+        queue.waiting.append(bytes);
+        return;
+    }
+    postConsoleOutput(globalObject, fd, bytes);
+    if (m_isExiting)
+        return;
+
+    // The port holds the loop while the batch is in flight, so what waits behind it is not lost to an idle exit.
+    queue.isAwaitingAck = true;
+    if (!m_listeners[fd])
+        listen(static_cast<NodePort>(fd));
+    port->jsRef(&globalObject);
 }
 
-JSValue NodeWorkerState::console(VM& vm, Zig::GlobalObject& globalObject, bool& isFinal)
+void NodeWorkerState::flushStdioForExit(Zig::GlobalObject& globalObject)
 {
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    JSObject* nativeConsole = m_nativeConsole.get();
-    // Before the start sequence nothing is decided, and the build of the Console may itself read
-    // `console`: both see the console the global was born with.
-    isFinal = m_tookFromParent && !m_isBuildingConsole;
-    // A Worker from the global constructor keeps that one.
-    if (!isFinal || !hasChannels())
-        return nativeConsole;
-    SetForScope building { m_isBuildingConsole, true };
-
-    JSValue stdoutStream = stdioStream(globalObject, 1);
-    RETURN_IF_EXCEPTION(scope, {});
-    JSValue stderrStream = stdioStream(globalObject, 2);
-    RETURN_IF_EXCEPTION(scope, {});
-    JSValue consoleConstructor = nativeConsole->get(&globalObject, Identifier::fromString(vm, "Console"_s));
-    RETURN_IF_EXCEPTION(scope, {});
-    // { stdout, stderr } without a prototype: user code has run by now, and the constructor must
-    // not take its other options from what that put on Object.prototype.
-    JSObject* options = constructEmptyObject(vm, globalObject.nullPrototypeObjectStructure());
-    options->putDirect(vm, Identifier::fromString(vm, "stdout"_s), stdoutStream);
-    options->putDirect(vm, Identifier::fromString(vm, "stderr"_s), stderrStream);
-    MarkedArgumentBuffer args;
-    args.append(options);
-    RELEASE_AND_RETURN(scope, JSC::construct(&globalObject, consoleConstructor, args, "console.Console is not a constructor"_s));
-}
-
-JSC_DEFINE_CUSTOM_GETTER(nodeWorkerConsoleGetter, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName propertyName))
-{
-    auto& vm = JSC::getVM(lexicalGlobalObject);
-    auto scope = DECLARE_THROW_SCOPE(vm);
-    auto* globalObject = dynamicDowncast<Zig::GlobalObject>(JSValue::decode(thisValue));
-    auto* nodeWorker = globalObject ? globalObject->nodeWorkerState() : nullptr;
-    if (!nodeWorker) [[unlikely]]
-        return JSValue::encode(jsUndefined());
-    bool isFinal = false;
-    JSValue console = nodeWorker->console(vm, *globalObject, isFinal);
-    RETURN_IF_EXCEPTION(scope, {});
-    if (isFinal)
-        globalObject->putDirect(vm, propertyName, console, PropertyAttribute::DontEnum | 0);
-    return JSValue::encode(console);
-}
-
-void NodeWorkerState::installConsoleSlot(VM& vm, Zig::GlobalObject& globalObject, PropertyName consoleName, JSObject* nativeConsole)
-{
-    m_nativeConsole.set(vm, &globalObject, nativeConsole);
-    globalObject.putDirectCustomAccessor(vm, consoleName, CustomGetterSetter::create(vm, nodeWorkerConsoleGetter, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue);
-    // node:console is `export default console`: the console that has `.Console`, whichever of the
-    // two is read first.
-    auto* registry = globalObject.internalModuleRegistry();
-    registry->internalField(InternalModuleRegistry::Field::NodeConsole).set(vm, registry, nativeConsole);
-}
-
-void NodeWorkerState::setMessagePortPrototypes(VM& vm, Zig::GlobalObject& globalObject, JSObject* prototype, JSObject* emitterPrototype)
-{
-    m_messagePortPrototype.set(vm, &globalObject, prototype);
-    m_messagePortEmitterPrototype.set(vm, &globalObject, emitterPrototype);
-    m_hasMessagePortMemberSlots = true;
-}
-
-void NodeWorkerState::setMessagePortNativeClose(VM& vm, Zig::GlobalObject& globalObject, JSObject* close)
-{
-    m_messagePortNativeClose.set(vm, &globalObject, close);
+    auto& vm = globalObject.vm();
+    m_isExiting = true;
+    for (unsigned fd = 1; fd <= 2; fd++) {
+        if (JSObject* flush = m_stdioFlush[fd - 1].get()) {
+            auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+            MarkedArgumentBuffer args;
+            JSC::profiledCall(&globalObject, ProfilingReason::API, flush, JSC::getCallData(flush), jsUndefined(), args);
+            if (auto* exception = scope.exception()) [[unlikely]] {
+                if (vm.isTerminationException(exception))
+                    return;
+                scope.clearException();
+                Zig::GlobalObject::reportUncaughtExceptionAtEventLoop(&globalObject, exception);
+            }
+            continue;
+        }
+        if (m_ports[fd])
+            releaseConsoleQueue(globalObject, fd);
+    }
 }
 
 template<typename Visitor>
@@ -312,13 +329,18 @@ void NodeWorkerState::visit(Visitor& visitor)
     visitor.append(m_workerData);
     visitor.append(m_stdioStreams.begin(), m_stdioStreams.end());
     visitor.append(m_stdioFlush.begin(), m_stdioFlush.end());
-    visitor.append(m_nativeConsole);
-    visitor.append(m_messagePortPrototype);
-    visitor.append(m_messagePortEmitterPrototype);
-    visitor.append(m_messagePortNativeClose);
+    visitor.append(m_consoleWrite.begin(), m_consoleWrite.end());
 }
 
 template void NodeWorkerState::visit(JSC::AbstractSlotVisitor&);
 template void NodeWorkerState::visit(JSC::SlotVisitor&);
 
 } // namespace Bun
+
+extern "C" void Bun__NodeWorker__writeConsole(JSC::JSGlobalObject* lexicalGlobalObject, uint8_t fd, const uint8_t* bytes, size_t length)
+{
+    // The worker's own global, also for a console call from a ShadowRealm or a node:vm context.
+    auto* globalObject = defaultGlobalObject(JSC::getVM(lexicalGlobalObject));
+    if (auto* nodeWorker = globalObject->nodeWorkerState())
+        nodeWorker->writeConsole(*globalObject, fd, { bytes, length });
+}

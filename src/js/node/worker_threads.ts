@@ -73,20 +73,17 @@ const {
   6: _markAsUntransferable,
   7: _isMarkedAsUntransferable,
   8: _markAsUncloneable,
-  // In a worker that this module's Worker made: the port entangled with that Worker's public
-  // port. The worker's native start sequence took it from the parent and started it; delivery
-  // waits until the entry module has evaluated and a 'message' listener exists.
+  // In a worker that this module's Worker made: the port entangled with that Worker's public port, started by the worker's native start sequence.
   9: _parentPort,
-  // In a node worker the native side has already put an object between MessagePort.prototype and
-  // EventTarget.prototype (JSMessagePort.cpp). The emitter methods go on it.
-  10: _messagePortEmitterPrototype,
   // The intrinsic web constructors, captured natively so user code replacing the
   // globals (e.g. happy-dom's registrator) before this module loads cannot break
   // worker_threads (#40268).
-  11: _MessagePort,
-  12: MessageChannel,
-  13: BroadcastChannel,
-  14: WebWorker,
+  10: _MessagePort,
+  11: MessageChannel,
+  12: BroadcastChannel,
+  13: createNodeWorker,
+  // The parent's Worker packed FileHandles of its transferList into workerData as markers (packJSTransferables).
+  14: _workerDataHasJSTransferables,
 } = $cpp("Worker.cpp", "createNodeWorkerThreadsBinding") as [
   unknown,
   number,
@@ -98,18 +95,18 @@ const {
   (value: unknown) => boolean,
   (value: unknown) => void,
   MessagePort | undefined,
-  object | undefined,
   typeof globalThis.MessagePort,
   typeof globalThis.MessageChannel,
   typeof globalThis.BroadcastChannel,
-  // The Worker constructor secretly takes two extra parameters. The first is the node:worker_threads
-  // instance, so that it can emit the `worker` event on the process with it instead of the Web
-  // Worker instance. The second is the worker's ends of the channels this module makes for it:
-  // [stdin | undefined, stdout, stderr, postMessageToThread hub, parentPort], then whether
-  // workerData carries FileHandle markers.
-  new (
-    ...args: [...ConstructorParameters<typeof globalThis.Worker>, nodeWorker: Worker, nodeChannels: unknown[]]
+  // Makes the native Worker of this module's Worker. `channels` are the worker's ends of [stdin | undefined, stdout, stderr, postMessageToThread hub, parentPort].
+  (
+    filename: string | URL,
+    options: Bun.WorkerOptions,
+    nodeWorker: Worker,
+    channels: (MessagePort | undefined)[],
+    workerDataHasJSTransferables: boolean,
   ) => WebWorker,
+  boolean,
 ];
 
 type NodeWorkerOptions = import("node:worker_threads").WorkerOptions;
@@ -122,9 +119,7 @@ function injectFakeEmitter(Class) {
   // Per-instance registry mapping each event to (user listener -> wrapper), so
   // listenerCount/eventNames/removeAllListeners work over EventTarget's opaque
   // internal map and off() can find the wrapper a given listener registered.
-  // Intrinsic Maps read through their private methods, so none of it routes through
-  // a Map or Map.prototype that user code replaced, whenever this module is loaded.
-  // Keyed by a module-local symbol, not a WeakMap.
+  // Intrinsic Maps read through their private methods: a worker can load this module after user code replaced Map or its prototype. Keyed by a module-local symbol, not a WeakMap.
   const kListenerRegistry = Symbol("listenerRegistry");
   function registryFor(target, create) {
     let map = target[kListenerRegistry];
@@ -266,8 +261,7 @@ function injectFakeEmitter(Class) {
       }
     };
     if (arguments.length === 0) {
-      // removeType only deletes `t`, and forEach tolerates deleting the entry it
-      // is visiting, so no snapshot copy is needed here.
+      // removeType only deletes `t`, and forEach tolerates deleting the entry it visits, so no snapshot copy is needed.
       map.$forEach((_byListener, t) => removeType(t));
     } else {
       removeType(type);
@@ -279,7 +273,7 @@ function injectFakeEmitter(Class) {
   // EventEmitter, not EventEmitter itself); use an intermediate prototype so
   // Object.getOwnPropertyNames(MessagePort.prototype) matches node.
   const proto = Class.prototype;
-  const inherited = _messagePortEmitterPrototype ?? Object.create(Object.getPrototypeOf(proto));
+  const inherited = Object.create(Object.getPrototypeOf(proto));
   const emitterMethods: [string, Function][] = [
     ["on", on],
     ["off", off],
@@ -296,7 +290,7 @@ function injectFakeEmitter(Class) {
   for (const [methodName, value] of emitterMethods) {
     Object.defineProperty(inherited, methodName, { value, writable: true, enumerable: false, configurable: true });
   }
-  if (inherited !== _messagePortEmitterPrototype) Object.setPrototypeOf(proto, inherited);
+  Object.setPrototypeOf(proto, inherited);
 }
 
 injectFakeEmitter(_MessagePort);
@@ -374,8 +368,7 @@ function deserializeJSTransferable(marker: Record<string, any>): unknown {
 
 function unpackJSTransferables(value: unknown, memo?: Map<object, unknown>): unknown {
   if (value === null || typeof value !== "object") return value;
-  // An intrinsic Map read through its private methods: in a worker this runs when the module is
-  // first required, which can be after user code replaced Map or its prototype's methods.
+  // An intrinsic Map read through its private methods, as for the listener registry.
   memo ??= new $Map();
   // The memo both breaks cycles (containers map to themselves) and preserves
   // reference identity for markers: structured clone keeps a marker shared
@@ -575,17 +568,11 @@ function packJSTransferables(options: NodeWorkerOptions): NodeWorkerOptions {
   return packed;
 }
 
-let workerData: any = unpackJSTransferables(_workerData);
+let workerData: any = _workerDataHasJSTransferables ? unpackJSTransferables(_workerData) : _workerData;
 let threadId = _threadId;
 // node: main-thread and unspecified-worker name are both "" (trimmed).
 const threadName = isMainThread ? "" : (_threadName ?? "");
-// A worker that this module's Worker made has a real MessagePort entangled with that Worker's
-// public port: adding a 'message' listener keeps this thread alive; close()/unref()/removing the
-// listeners let the thread exit, node's parentPort lifecycle. Only parentPort receives what the
-// parent posts: `self.onmessage` on the global scope is not a channel in a node worker, as in node.
-// A raw `new Worker()` (web) that loads this module has no such port, so it keeps the global-scope
-// facade. The worker's stdio, its postMessageToThread port and its `process` restrictions are set
-// up natively before the entry point runs, whether or not this module is ever loaded there.
+// As in node, a 'message' listener on parentPort keeps the thread alive, and `self.onmessage` is not a channel from the parent. A raw `new Worker()` (web) that loads this module has no such port and keeps the global-scope facade.
 let parentPort: MessagePort | null = _parentPort ?? null;
 const messaging = require("internal/worker/messaging");
 if (!isMainThread && parentPort === null) parentPort = fakeParentPort();
@@ -768,9 +755,7 @@ class Worker extends EventEmitter {
       // transferList entry or a busy FileHandle's kTransfer()).
       options = packJSTransferables(options);
 
-      // The channels between this object and its worker. The parent keeps one end of each; the
-      // worker's ends go to it natively (the fourth argument of the constructor below), so its
-      // start sequence takes them without evaluating this module there.
+      // The channels between this object and its worker. The worker's ends go to its native start sequence (createNodeWorker below), which takes them without evaluating this module there.
       let stdinForWorker: MessagePort | undefined;
       if (options.stdin) {
         const channel = new MessageChannel();
@@ -799,10 +784,6 @@ class Worker extends EventEmitter {
         stderrChannel.port2,
         channel.portToWorker,
         publicChannel.port2,
-        // packJSTransferables() above left markers inside workerData for the FileHandles of the
-        // transferList. Only this module turns them back into FileHandles, so the worker
-        // evaluates it before its entry point.
-        options[kRestoreJSTransferables] !== undefined,
       ];
       options = {
         ...options,
@@ -826,7 +807,15 @@ class Worker extends EventEmitter {
       nativeMessagePortStart.$call(this.#stdoutPort);
       nativeMessagePortStart.$call(this.#stderrPort);
       nativeMessagePortStart.$call(this.#publicPort);
-      this.#worker = new WebWorker(filename, options as Bun.WorkerOptions, this, nodeChannels);
+      // On the main thread this port stays here. A worker sends it to the main thread below.
+      if (isMainThread) nativeMessagePortStart.$call(portToMain);
+      this.#worker = createNodeWorker(
+        filename,
+        options as Bun.WorkerOptions,
+        this,
+        nodeChannels,
+        options[kRestoreJSTransferables] !== undefined,
+      );
       // Create the readables eagerly so the worker's writev is ack'd even when
       // worker.stdout/stderr is never touched; only captured streams ref their
       // port on first read (node's kIncrementsPortRef).

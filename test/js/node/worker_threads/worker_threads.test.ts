@@ -3510,10 +3510,8 @@ test("a ShadowRealm in a worker can import node:worker_threads", async () => {
   expect(exitCode).toBe(0);
 });
 
-// A worker made by node:worker_threads' Worker starts natively. It takes its channels from the
-// parent and evaluates no builtin module. What needs one is built when the worker first uses it:
-// process.stdout / stderr / stdin, console, the MessagePort emitter methods, postMessageToThread.
-// So each of these is used here in a worker that never loads node:worker_threads.
+// A worker of node:worker_threads starts natively: it evaluates no builtin module before its entry
+// point. Its console is the native one, and process.stdout / stderr / stdin are built on first use.
 describe("node worker start sequence", () => {
   // Runs `source` in a worker. Resolves with what the worker wrote and its exit code.
   async function runWorker(source: string, options: import("node:worker_threads").WorkerOptions = {}) {
@@ -3526,26 +3524,42 @@ describe("node worker start sequence", () => {
     return { stdout, stderr, exitCode };
   }
 
-  test("compiles no more functions before the entry point than a Web Worker's does", async () => {
-    // A function that ran has a code block. The count is taken in the first statement of each entry.
-    const count = `const { FunctionCodeBlock } = require("bun:jsc").heapStats().objectTypeCounts;`;
+  test("compiles no more functions before the entry point than a Web Worker does", async () => {
+    // A function that ran has a code block. Each entry counts them in its first statement.
+    const count = `require("bun:jsc").heapStats().objectTypeCounts.FunctionCodeBlock`;
+    const post = `require("node:worker_threads").parentPort.postMessage(count);`;
     using dir = tempDir("worker-start-sequence", {
-      "web.cjs": `${count} postMessage(FunctionCodeBlock);`,
-      "node.cjs": `${count} require("node:worker_threads").parentPort.postMessage(FunctionCodeBlock);`,
+      "web.cjs": `const count = ${count}; postMessage(count);`,
+      "node.cjs": `const count = ${count}; ${post}`,
+      "web.mjs": `import { heapStats } from "bun:jsc"; const count = heapStats().objectTypeCounts.FunctionCodeBlock; postMessage(count);`,
+      "node.mjs": `import { heapStats } from "bun:jsc"; const count = heapStats().objectTypeCounts.FunctionCodeBlock; (await import("node:worker_threads")).parentPort.postMessage(count);`,
+      // The console of a node worker is native too.
+      "web-console.cjs": `console.error("web"); const count = ${count}; postMessage(count);`,
+      "node-console.cjs": `console.error("node"); const count = ${count}; ${post}`,
       "main.cjs": `
         const { Worker: NodeWorker } = require("node:worker_threads");
         const { once } = require("node:events");
+        const web = file => new Promise(resolve => {
+          const worker = new Worker(__dirname + "/" + file);
+          worker.onmessage = event => { worker.terminate(); resolve(event.data); };
+        });
+        const node = async (file, options) => {
+          const worker = new NodeWorker(__dirname + "/" + file, options);
+          const exited = once(worker, "exit");
+          const [count] = await once(worker, "message");
+          await exited;
+          return count;
+        };
         (async () => {
-          const web = new Worker(__dirname + "/web.cjs");
-          const counts = { web: (await new Promise(resolve => (web.onmessage = resolve))).data };
-          web.terminate();
-          const shapes = { node: {}, nodeWithOptions: { stdin: true, stdout: true, workerData: ["data"], name: "named" } };
-          for (const shape in shapes) {
-            const worker = new NodeWorker(__dirname + "/node.cjs", shapes[shape]);
-            [counts[shape]] = await once(worker, "message");
-            await once(worker, "exit");
-          }
-          console.log(JSON.stringify(counts));
+          console.log(JSON.stringify({
+            web: { cjs: await web("web.cjs"), mjs: await web("web.mjs"), console: await web("web-console.cjs") },
+            node: {
+              cjs: await node("node.cjs"),
+              mjs: await node("node.mjs"),
+              console: await node("node-console.cjs"),
+              withOptions: await node("node.cjs", { stdin: true, stdout: true, workerData: ["data"], name: "named" }),
+            },
+          }));
         })();
       `,
     });
@@ -3554,12 +3568,14 @@ describe("node worker start sequence", () => {
       env: bunEnv,
       cwd: String(dir),
       stdout: "pipe",
-      stderr: "inherit",
+      stderr: "pipe",
     });
-    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
-    const { web, ...node } = JSON.parse(stdout);
-    expect(web).toBeGreaterThan(0);
-    expect(node).toEqual({ node: web, nodeWithOptions: web });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stderr).toBe("web\nnode\n");
+    const { web, node } = JSON.parse(stdout);
+    expect(node).toEqual({ cjs: web.cjs, mjs: web.mjs, console: web.console, withOptions: web.cjs });
+    // The CommonJS wrapper of the entry and what `require` ran.
+    expect(web.cjs).toBeLessThan(10);
     expect(exitCode).toBe(0);
   });
 
@@ -3582,15 +3598,150 @@ describe("node worker start sequence", () => {
     expect(exitCode).toBe(0);
   });
 
-  test("console and process.stdout / stderr write to the parent's worker.stdout / stderr", async () => {
+  // Node has one 'exit' listener there (flushSync). Bun flushes natively.
+  test("process has no 'exit' listener of its own, and require('node:console') is the global console", async () => {
     const result = await runWorker(`
-      const { Console } = require("node:console");
-      console.log("log", typeof Console, console instanceof Console);
-      console.error("error");
-      process.stdout.write("write\\n");
-      process.stderr.write("write\\n");
+      const listeners = process.listenerCount("exit");
+      const nodeConsole = require("node:console");
+      console.log(JSON.stringify([listeners, nodeConsole === console, console._stdout === process.stdout, console._stderr === process.stderr]));
     `);
-    expect(result).toEqual({ stdout: "log function true\nwrite\n", stderr: "error\nwrite\n", exitCode: 0 });
+    expect(result).toEqual({ stdout: "[0,true,true,true]\n", stderr: "", exitCode: 0 });
+  });
+
+  describe("console", () => {
+    // As on the main thread, and as in workers before 1.4: objects are not formatted by util.inspect.
+    test("every method goes to the parent's worker.stdout or worker.stderr, in order with process.stdout and stderr", async () => {
+      const worker = new Worker(
+        `console.log("log %s %d", "s", 42, { a: 1, nested: { b: [1, 2] } });
+         console.info("info");
+         console.table([{ x: 1 }]);
+         console.count("c"); console.count("c");
+         console.group("g"); console.log("in group"); console.groupEnd(); console.log("after group");
+         console.dir({ deep: { deeper: {} } }, { depth: 0 });
+         console.log();
+         process.stdout.write("raw out\\n");
+         console.debug("after raw out");
+         console.error("err");
+         console.warn("warn");
+         console.assert(false, "assert %s", "msg"); console.assert(false); console.assert(true, "nope");
+         console.time("t"); console.timeLog("t", "mid"); console.timeEnd("t");
+         console.error();
+         process.stderr.write("raw err\\n");
+         console.error("after raw err");
+         console.clear();
+         require("node:worker_threads").parentPort.postMessage(Bun.inspect({ a: 1, nested: { b: [1, 2] } }));`,
+        { eval: true, stdout: true, stderr: true },
+      );
+      let stdout = "";
+      let stderr = "";
+      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      worker.stderr.setEncoding("utf8").on("data", chunk => (stderr += chunk));
+      const exited = once(worker, "exit");
+      const [mainThreadFormat] = await once(worker, "message");
+      const [exitCode] = await exited;
+      expect(stdout).toBe(
+        `log s 42 ${mainThreadFormat}\n` +
+          "info\n" +
+          "┌───┬───┐\n│   │ x │\n├───┼───┤\n│ 0 │ 1 │\n└───┴───┘\n" +
+          "c: 1\nc: 2\n" +
+          "g\n  in group\nafter group\n" +
+          "{\n  deep: [Object ...],\n}\n" +
+          "\n" +
+          "raw out\n" +
+          "after raw out\n",
+      );
+      expect(stderr.replace(/\[\d+\.\d+m?s\]/g, "[time]")).toBe(
+        "err\nwarn\nassert msg\nAssertion failed\n[time] t mid\n[time] t\n\nraw err\nafter raw err\n",
+      );
+      expect(exitCode).toBe(0);
+    });
+
+    // The worker's streams are not TTYs.
+    test("has no colors when the console of the process has", async () => {
+      await using proc = Bun.spawn({
+        cmd: [
+          bunExe(),
+          "-e",
+          `const { Worker } = require("node:worker_threads");
+           const worker = new Worker('console.log("log", { a: 1 }); console.table([{ x: 1 }]); console.count(); console.trace("trace"); console.error(new Error("error")); console.time("t"); console.timeEnd("t")', { eval: true, stdout: true, stderr: true });
+           let output = "";
+           worker.stdout.setEncoding("utf8").on("data", chunk => (output += chunk));
+           worker.stderr.setEncoding("utf8").on("data", chunk => (output += chunk));
+           worker.on("exit", () => console.log(JSON.stringify({ output, colored: Bun.inspect({ a: 1 }, { colors: Bun.enableANSIColors }) !== Bun.inspect({ a: 1 }) })));`,
+        ],
+        env: { ...bunEnv, FORCE_COLOR: "1", NO_COLOR: undefined },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect(stderr).toBe("");
+      const { output, colored } = JSON.parse(stdout);
+      expect(colored).toBe(true);
+      expect(output).toContain("log {\n  a: 1,\n}\n");
+      expect(output).toContain("trace\n");
+      expect(output).toContain("error: error\n");
+      expect(output).not.toContain("\x1b[");
+      expect(exitCode).toBe(0);
+    });
+
+    // Node's Console does the same (ignoreErrors).
+    test("drops what a broken process.stdout does not take, and does not throw", async () => {
+      const worker = new Worker(
+        `console.log("1 before process.stdout exists");
+         const stdout = process.stdout;
+         process.stdout = { write() { throw new Error("not this one"); } };
+         console.log("2 to the stream the worker was given");
+         process.stdout = stdout;
+         stdout.write = () => { throw new Error("write threw"); };
+         let threw = false;
+         try { console.log("dropped"); console.count("dropped"); } catch { threw = true; }
+         delete stdout.write;
+         stdout.end();
+         try { console.log("dropped after end"); } catch { threw = true; }
+         process.stderr.destroy();
+         try { console.error("dropped after destroy"); console.timeEnd("never started"); } catch { threw = true; }
+         require("node:worker_threads").parentPort.postMessage(threw);`,
+        { eval: true, stdout: true, stderr: true },
+      );
+      let stdout = "";
+      let stderr = "";
+      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      worker.stderr.setEncoding("utf8").on("data", chunk => (stderr += chunk));
+      const exited = once(worker, "exit");
+      expect(await once(worker, "message")).toEqual([false]);
+      const [exitCode] = await exited;
+      expect({ stdout, stderr, exitCode }).toEqual({
+        stdout: "1 before process.stdout exists\n2 to the stream the worker was given\n",
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
+    // Node evaluates its builtins before user code. The console of a worker needs none here.
+    test.each([
+      ["Object.prototype is frozen", `Object.freeze(Object.prototype);`],
+      ["Map is replaced", `globalThis.Map = class { constructor() { throw new Error("not a Map"); } };`],
+      ["Set is replaced", `globalThis.Set = class { constructor() { throw new Error("not a Set"); } };`],
+      [
+        "Object.defineProperty is replaced",
+        `Object.defineProperty = () => { throw new Error("not defineProperty"); };`,
+      ],
+      ["Symbol.for is replaced", `Symbol.for = () => { throw new Error("not Symbol.for"); };`],
+      ["process is removed", `delete globalThis.process; globalThis.process = undefined;`],
+      ["require('node:console').Console is replaced", `require("node:console").Console = class { log() {} };`],
+    ])("prints after %s", async (_label, tamper) => {
+      const result = await runWorker(`${tamper} console.log("printed"); console.error("printed");`);
+      expect(result).toEqual({ stdout: "printed\n", stderr: "printed\n", exitCode: 0 });
+    });
+
+    test("of a ShadowRealm and of a node:vm context writes to the same streams", async () => {
+      const result = await runWorker(`
+        new ShadowRealm().evaluate('console.log("realm"); 0');
+        require("node:vm").runInNewContext('console.log("context")', { console });
+        console.log("worker");
+      `);
+      expect(result).toEqual({ stdout: "realm\ncontext\nworker\n", stderr: "", exitCode: 0 });
+    });
   });
 
   test("process.stdin is at its end unless the worker has { stdin: true }", async () => {
@@ -3601,95 +3752,97 @@ describe("node worker start sequence", () => {
     expect(result).toEqual({ stdout: "end 0", stderr: "", exitCode: 0 });
   });
 
-  // The streams and the Console are constructed after user code has run.
-  test("Object.prototype does not configure console and the stdio streams", async () => {
-    const pollute = `Object.assign(Object.prototype, { objectMode: true, highWaterMark: 1, colorMode: true, groupIndentation: 7 });`;
+  // The streams are constructed after user code has run.
+  test("Object.prototype does not configure the stdio streams", async () => {
+    const pollute = `Object.assign(Object.prototype, { objectMode: true, highWaterMark: 1, decodeStrings: true });`;
     const use = `
       const wrote = [process.stdout.write("ab"), process.stdout.write("cd\\n"), process.stderr.write(Buffer.from("ef\\n"))];
-      console.group("group");
-      console.log({ a: [1, "two"] }, wrote);
-      console.groupEnd();
-      console.warn("%s", "warn");
+      process.stdout.write(JSON.stringify([wrote, process.stdout.writableHighWaterMark, process.stdout.writableObjectMode, process.stdin.readableObjectMode]) + "\\n");
     `;
-    const build = `const built = [console, process.stdout, process.stderr, process.stdin];`;
+    const build = `const built = [process.stdout, process.stderr, process.stdin];`;
     const builtAfter = await runWorker(pollute + use);
     expect(builtAfter).toEqual(await runWorker(build + pollute + use));
     expect(builtAfter.exitCode).toBe(0);
   });
 
-  test("a read of console or a stdio stream that fails to build it throws, and the next read builds it", async () => {
-    // An EventEmitter reads this._events when it is constructed.
-    const result = await runWorker(`
-      Object.defineProperty(Object.prototype, "_events", { get() { throw new Error("not now"); }, configurable: true });
-      const errors = [() => console, () => process.stdout, () => process.stderr, () => process.stdin].map(read => {
-        try { read(); } catch (e) { return e.message; }
-      });
-      delete Object.prototype._events;
-      console.log(JSON.stringify(errors));
-      process.stderr.write("stderr\\n");
-      process.stdin.on("data", () => {}).on("end", () => process.stdout.write("stdin end\\n"));
-    `);
-    expect(result).toEqual({
-      stdout: '["not now","not now","not now","not now"]\nstdin end\n',
-      stderr: "stderr\n",
-      exitCode: 0,
-    });
-  });
+  // An EventEmitter reads this._events when it is constructed, so this getter fails the build of a stream.
+  test.each(["stdout", "stderr", "stdin"])(
+    "a read of process.%s that fails to build it throws, and the next read builds it",
+    async name => {
+      const result = await runWorker(`
+        Object.defineProperty(Object.prototype, "_events", { get() { throw new Error("not now"); }, configurable: true });
+        const seen = ["${name}" in process];
+        try { process.${name}; } catch (e) { seen.push(e.message); }
+        try { Object.getOwnPropertyDescriptor(process, "${name}"); } catch (e) { seen.push(e.message); }
+        delete Object.prototype._events;
+        seen.push(typeof process.${name}.on, process.${name} === process.${name});
+        if ("${name}" !== "stdin") seen.push(console._${name} === process.${name});
+        console.log(JSON.stringify(seen));
+        console.error("stderr");
+        process.stdin.on("data", () => {}).on("end", () => process.stdout.write("stdin end\\n"));
+      `);
+      const seen = [true, "not now", "not now", "function", true, ...(name === "stdin" ? [] : [true])];
+      expect(result).toEqual({ stdout: JSON.stringify(seen) + "\nstdin end\n", stderr: "stderr\n", exitCode: 0 });
+    },
+  );
 
-  test("a synchronous exit writes buffered output ahead of an 'exit' listener added before the first write", async () => {
-    const result = await runWorker(`
-      process.on("exit", () => process.stdout.write("exit listener\\n"));
-      for (let i = 0; i < 5; i++) process.stdout.write("line " + i + "\\n");
-      process.exit(3);
-    `);
-    expect(result).toEqual({
-      stdout: "line 0\nline 1\nline 2\nline 3\nline 4\nexit listener\n",
-      stderr: "",
-      exitCode: 3,
-    });
-  });
-
-  test("MessagePort has node's emitter methods, close(callback) and inspect hook", async () => {
-    const shape = `JSON.stringify([MessagePort.prototype, Object.getPrototypeOf(MessagePort.prototype)].map(Object.getOwnPropertyNames))`;
-    const { stdout, exitCode } = await runWorker(`
-      const shape = ${shape};
-      const { port1, port2 } = new MessageChannel();
-      port1.once("message", message => {
-        const emitter = Object.getPrototypeOf(MessagePort.prototype);
-        const on = Object.getOwnPropertyDescriptor(emitter, "on");
-        const report = {
-          message,
-          listeners: [port2.listenerCount("message"), port2.on("message", () => {}).listenerCount("message")],
-          on: [typeof on.value, on.writable, on.enumerable, on.configurable],
-          inspect: typeof port1[Symbol.for("nodejs.util.inspect.custom")],
-          emitter: Object.getOwnPropertyNames(emitter),
-          sameShape: shape === ${shape},
-        };
-        port1.close(() => process.stdout.write(JSON.stringify(report)));
+  describe("a synchronous exit", () => {
+    test("writes what waits for the parent ahead of the 'exit' listeners", async () => {
+      const result = await runWorker(`
+        process.on("exit", () => {
+          process.stdout.write("exit listener " + process.stdout.writableLength + "\\n");
+          console.log("exit listener console");
+        });
+        for (let i = 0; i < 5; i++) process.stdout.write("line " + i + "\\n");
+        for (let i = 0; i < 5; i++) console.error("error " + i);
+        process.exit(3);
+      `);
+      expect(result).toEqual({
+        stdout: "line 0\nline 1\nline 2\nline 3\nline 4\nexit listener 0\nexit listener console\n",
+        stderr: "error 0\nerror 1\nerror 2\nerror 3\nerror 4\n",
+        exitCode: 3,
       });
-      port2.postMessage("hello");
-    `);
-    expect(JSON.parse(stdout)).toEqual({
-      message: "hello",
-      listeners: [0, 1],
-      on: ["function", true, false, true],
-      inspect: "function",
-      emitter: [
-        "on",
-        "off",
-        "once",
-        "emit",
-        "addListener",
-        "removeListener",
-        "listenerCount",
-        "eventNames",
-        "removeAllListeners",
-        "setMaxListeners",
-        "getMaxListeners",
-      ],
-      sameShape: true,
     });
-    expect(exitCode).toBe(0);
+
+    test.each([
+      ["the entry point returns", ""],
+      ["process.exit(3)", "process.exit(3);"],
+    ])("writes what an 'exit' listener is the first to write, when %s", async (_label, exit) => {
+      const result = await runWorker(`
+        process.on("exit", code => {
+          console.log("console.log " + code);
+          process.stdout.write("stdout.write\\n");
+          console.log("console.log again");
+          console.error("console.error");
+          process.stderr.write("stderr.write\\n");
+        });
+        ${exit}
+      `);
+      const code = exit ? 3 : 0;
+      expect(result).toEqual({
+        stdout: `console.log ${code}\nstdout.write\nconsole.log again\n`,
+        stderr: "console.error\nstderr.write\n",
+        exitCode: code,
+      });
+    });
+
+    test("writes the console output of a worker that has no process object", async () => {
+      const lines = Array.from({ length: 300 }, (_, i) => "line " + i + "\n").join("");
+      const worker = new Worker(
+        `for (let i = 0; i < 300; i++) console.log("line " + i);
+         for (let i = 0; i < 300; i++) console.error("line " + i);
+         throw new Error("entry point");`,
+        { eval: true, stdout: true, stderr: true },
+      );
+      let stdout = "";
+      let stderr = "";
+      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      worker.stderr.setEncoding("utf8").on("data", chunk => (stderr += chunk));
+      const exited = new Promise(resolve => worker.on("exit", resolve));
+      const [error] = await once(worker, "error");
+      await exited;
+      expect({ stdout, stderr, error: error.message }).toEqual({ stdout: lines, stderr: lines, error: "entry point" });
+    });
   });
 
   describe("postMessageToThread", () => {
@@ -3710,9 +3863,10 @@ describe("node worker start sequence", () => {
       );
       let stdout = "";
       worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      const exited = once(worker, "exit");
       await postMessageToThread(worker.threadId, "first");
       await postMessageToThread(worker.threadId, "last");
-      await once(worker, "exit");
+      await exited;
       expect(stdout).toBe(`["first",0]\n["last",0]\n`);
     });
 
@@ -3727,31 +3881,32 @@ describe("node worker start sequence", () => {
       }
     });
 
-    test("rejects when the worker's entry point throws", async () => {
-      const worker = new Worker(`throw new Error("entry point");`, { eval: true });
-      const errored = once(worker, "error");
-      const exited = new Promise(resolve => worker.on("exit", resolve));
-      expect(await postMessageToThread(worker.threadId, "message").catch(e => e.code)).toBe(
-        "ERR_WORKER_MESSAGING_FAILED",
-      );
-      expect((await errored)[0].message).toBe("entry point");
-      await exited;
-    });
-
-    // Nothing in the worker answers a message that is still in its port when the thread exits.
-    test("rejects when the worker exits with the message in its port", async () => {
+    // The worker holds its entry point until the message is in its port.
+    test.each([
+      ["delivers to a listener of", `process.on("workerMessage", value => process.stdout.write("got " + value));`, []],
+      ["rejects without a listener in", "", ["ERR_WORKER_MESSAGING_FAILED"]],
+    ])("%s a worker whose entry point throws after the message was sent", async (_label, listen, rejection) => {
       const sent = new Int32Array(new SharedArrayBuffer(4));
       const worker = new Worker(
-        `process.on("workerMessage", () => {});
+        `${listen}
          Atomics.wait(new Int32Array(require("node:worker_threads").workerData), 0, 0);
-         process.exit(0);`,
-        { eval: true, workerData: sent.buffer },
+         throw new Error("entry point");`,
+        { eval: true, stdout: true, workerData: sent.buffer },
       );
-      const reply = postMessageToThread(worker.threadId, "message").catch(e => e.code);
+      let stdout = "";
+      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      const errored = once(worker, "error");
+      const exited = new Promise(resolve => worker.on("exit", resolve));
+      const reply = postMessageToThread(worker.threadId, "message").then(
+        () => [],
+        e => [e.code],
+      );
       Atomics.store(sent, 0, 1);
       Atomics.notify(sent, 0);
-      expect(await reply).toBe("ERR_WORKER_MESSAGING_FAILED");
-      await once(worker, "exit");
+      expect(await reply).toEqual(rejection);
+      expect((await errored)[0].message).toBe("entry point");
+      await exited;
+      expect(stdout).toBe(listen ? "got message" : "");
     });
   });
 
@@ -3784,32 +3939,42 @@ describe("node worker start sequence", () => {
       );
       let stdout = "";
       worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      const exited = once(worker, "exit");
       const { promise, resolve } = Promise.withResolvers<Error | null | undefined>();
       worker.stdin!.write("first ", resolve);
       await promise;
       worker.postMessage("read");
       worker.stdin!.end("second");
-      await once(worker, "exit");
+      await exited;
       expect(stdout).toBe("first second");
     });
   });
 
-  // As in Node for an ES module entry point.
-  test("an ES module entry point's nextTick callbacks run after its microtasks", async () => {
-    using dir = tempDir("worker-start-tick-order", {
-      "entry.mjs": `
-        const order = [];
-        queueMicrotask(() => order.push("microtask"));
-        process.nextTick(() => order.push("nextTick"));
-        Promise.resolve().then(() => order.push("then"));
-        setImmediate(() => process.stdout.write(order.join(" ")));
-      `,
+  describe("process.nextTick callbacks of the entry point", () => {
+    const entry = `
+      const order = [];
+      queueMicrotask(() => order.push("microtask"));
+      process.nextTick(() => order.push("nextTick"));
+      Promise.resolve().then(() => order.push("then"));
+      setImmediate(() => process.stdout.write(order.join(" ")));
+    `;
+    async function order(file: string) {
+      using dir = tempDir("worker-start-tick-order", { [file]: entry });
+      const worker = new Worker(join(String(dir), file), { stdout: true });
+      let stdout = "";
+      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
+      await once(worker, "exit");
+      return stdout;
+    }
+
+    test("run after its microtasks for an ES module, as in Node", async () => {
+      expect(await order("entry.mjs")).toBe("microtask then nextTick");
     });
-    const worker = new Worker(join(String(dir), "entry.mjs"), { stdout: true });
-    let stdout = "";
-    worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
-    await once(worker, "exit");
-    expect(stdout).toBe("microtask then nextTick");
+
+    // Since 1.4.0 they run after the microtasks, as for an ES module.
+    test.todo("run before its microtasks for a CommonJS module, as in Node", async () => {
+      expect(await order("entry.cjs")).toBe("nextTick microtask then");
+    });
   });
 
   test("environmentData reaches a worker started by a worker that never loaded node:worker_threads", async () => {
@@ -3829,33 +3994,27 @@ describe("node worker start sequence", () => {
     }
   });
 
-  // A third argument makes the global constructor start a node worker. It has no channels to a
-  // node:worker_threads Worker object, so its stdio is the process's own.
-  test("a worker from the global constructor with a third argument", async () => {
-    using dir = tempDir("worker-start-three-arguments", {
-      "entry.cjs": `
-        const { parentPort, workerData } = require("node:worker_threads");
-        console.log("console");
-        process.stdout.write("stdout\\n");
-        parentPort.postMessage([process.chdir.disabled, workerData]);
-      `,
-      "main.cjs": `
-        const worker = new Worker(__dirname + "/entry.cjs", { workerData: "data" }, {});
-        worker.onmessage = event => {
-          console.log(JSON.stringify(event.data));
-          worker.terminate();
-        };
-      `,
+  // Only the worker's native state keeps these alive: workerData until the module reads it, and what the console writes to a stream with.
+  test("what the worker keeps for later use survives a collection", async () => {
+    const result = await runWorker(
+      `(function build() {
+         process.stdout.write("stdout\\n");
+         process.stderr.write("stderr\\n");
+         delete process.stdout;
+         delete process.stderr;
+       })();
+       setImmediate(() => {
+         Bun.gc(true);
+         console.log("console.log");
+         console.error("console.error");
+         console.log(JSON.stringify(require("node:worker_threads").workerData));
+       });`,
+      { workerData: { data: [1, 2, 3], text: "text".repeat(100) } },
+    );
+    expect(result).toEqual({
+      stdout: `stdout\nconsole.log\n${JSON.stringify({ data: [1, 2, 3], text: "text".repeat(100) })}\n`,
+      stderr: "stderr\nconsole.error\n",
+      exitCode: 0,
     });
-    await using proc = Bun.spawn({
-      cmd: [bunExe(), "main.cjs"],
-      env: bunEnv,
-      cwd: String(dir),
-      stdout: "pipe",
-      stderr: "inherit",
-    });
-    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
-    expect(stdout).toBe(`console\nstdout\n[true,"data"]\n`);
-    expect(exitCode).toBe(0);
   });
 });

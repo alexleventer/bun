@@ -1,9 +1,6 @@
 // Port-backed stdio streams shared by both ends of a node:worker_threads Worker:
 // worker.stdout/stderr/stdin on the parent, process.stdout/stderr/stdin in the
-// worker (built on first use from NodeWorkerState.cpp via ProcessObjectInternals).
-// The worker's are built after user code has run, so the option objects here have
-// no prototype: the stream constructors must not read what user code put on
-// Object.prototype.
+// worker (built lazily from BunProcess.cpp via ProcessObjectInternals).
 //
 // Each stream rides its own MessageChannel with node's flow control
 // (lib/internal/worker/io.js): the writer posts an array of chunks and withholds
@@ -37,6 +34,7 @@ function makePortReadable(port: MessagePort, incrementsPortRef: boolean) {
   }
   const Readable = require("internal/streams/readable");
   const stream: PortReadable = new Readable({
+    // A worker builds its streams after user code ran: the options are not taken from Object.prototype.
     __proto__: null,
     read() {
       if (startedReading === false && incrementsPortRef) {
@@ -91,8 +89,6 @@ function makePortWritable(port: MessagePort) {
       cb();
     }
   }
-  port.addEventListener("message", onAck);
-  port.unref();
   const stream = new Writable({
     __proto__: null,
     decodeStrings: false,
@@ -136,7 +132,20 @@ function makePortWritable(port: MessagePort) {
   // the Writable clear its buffer through writev, which now completes
   // synchronously because process._exiting is set (node's flushSync).
   stream[kFlushSync] = onAck;
+  // Last: a constructor that threw must leave nothing on the port.
+  port.addEventListener("message", onAck);
+  port.unref();
   return stream;
+}
+
+// How the console of a worker writes to its process.stdout / stderr once that exists. As node's Console (ignoreErrors), it does not throw what the stream throws.
+function makeConsoleWriter(stream: import("node:stream").Writable) {
+  return function (chunk: Buffer) {
+    if (stream.writable === false) return;
+    try {
+      stream.write(chunk);
+    } catch {}
+  };
 }
 
 // A node worker's process.stdin without { stdin: true }.
@@ -152,6 +161,7 @@ function makeEndedReadable() {
 
 export default {
   kFlushSync,
+  makeConsoleWriter,
   makePortReadable,
   makePortWritable,
   makeEndedReadable,

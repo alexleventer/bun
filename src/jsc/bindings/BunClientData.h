@@ -359,16 +359,12 @@ private:
     Vector<VersionSqlite3*> m_sqliteDatabases;
     bool m_isWorkerVM { false };
     bool m_isNodeWorkerVM { false };
-    bool m_nodeWorkerEnvNamesIPCChannel { false };
 
 public:
     // upstream's `&vm != commonVMOrNull()`
     bool isWorkerVM() const { return m_isWorkerVM; }
     // Created by node:worker_threads' Worker (WorkerOptions::Kind::Node), as opposed to the Web Worker constructor.
     bool isNodeWorkerVM() const { return m_isNodeWorkerVM; }
-    // A node worker whose process.env has NODE_CHANNEL_FD: node then disables process.send() and the
-    // rest of the IPC surface there; otherwise a worker has none of it.
-    bool nodeWorkerEnvNamesIPCChannel() const { return m_nodeWorkerEnvNamesIPCChannel; }
     // VM thread. Unlinking is the client's own (`remove()` in its destructor).
     void addClient(JSVMClientDataClient& client) { m_clients.append(&client); }
     // VM thread. The bun:sqlite connections this VM has; each one removes itself in its destructor.

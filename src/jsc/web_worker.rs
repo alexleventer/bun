@@ -163,9 +163,7 @@ unsafe extern "C" {
     );
     safe fn WebWorker__parentContextWillDestroy(proxy: *mut c_void);
     safe fn WebWorker__entrySettled(global: &JSGlobalObject);
-    /// Takes what the parent's `node:worker_threads` `Worker` sent to this VM
-    /// (workerData, the stdio / parentPort / postMessageToThread ports). Runs
-    /// no builtin module. May leave an exception pending.
+    /// Takes what the parent's `node:worker_threads` `Worker` sent to this VM. May leave an exception pending.
     safe fn Bun__Worker__startNodeWorker(global: &JSGlobalObject);
     safe fn WebWorker__dispatchError(
         global: &JSGlobalObject,
@@ -846,9 +844,7 @@ impl WebWorker {
             return self.shutdown();
         }
 
-        // Node runs its worker bootstrap (parentPort, stdio, process overrides)
-        // ahead of user code. Ours is native and evaluates no builtin module:
-        // what needs one is built when the worker first uses it.
+        // Node runs its worker bootstrap ahead of user code. Ours is native and evaluates no builtin module (NodeWorkerState.h).
         if self.is_node_worker {
             let global = vm.global();
             if let Err(err) = jsc::host_fn::from_js_host_call_generic(global, || {
@@ -882,11 +878,9 @@ impl WebWorker {
             }
         };
 
-        // Fire (and clear) the entryEvaluated hook on EVERY post-evaluation path
-        // so buffered postMessageToThread deliveries drain and the sender's
-        // Atomics.waitAsync settles. WebWorker__entrySettled re-calls it as a no-op.
+        // On every post-evaluation path: what postMessageToThread() sent to a node worker meanwhile is delivered here, so its sender's Atomics.waitAsync settles even when the entry failed.
         WebWorker__entrySettled(vm.global());
-        // The hook runs JS, which can request termination. If it did, stop before the start sequence's GC.
+        // That delivery runs JS, which can request termination. If it did, stop before the start sequence's GC.
         if self.has_requested_terminate() {
             self.flush_logs(vm);
             return self.shutdown();

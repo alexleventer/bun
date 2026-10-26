@@ -1204,8 +1204,8 @@ GlobalObject::GlobalObject(JSC::VM& vm, JSC::Structure* structure, WebCore::Scri
     // m_scriptExecutionContext = globalEventScope.m_context;
     mockModule = Bun::JSMockModule::create(this);
     globalEventScope->m_context = m_scriptExecutionContext;
-    // A worker's default global is the one made with its context id.
-    if (static_cast<JSVMClientData*>(vm.clientData)->isNodeWorkerVM())
+    // The default global of a worker is made before its VM has one. A ShadowRealm's global is made after.
+    if (auto* clientData = static_cast<JSVMClientData*>(vm.clientData); clientData->isNodeWorkerVM() && !clientData->defaultGlobalObject)
         m_nodeWorkerState = makeUnique<Bun::NodeWorkerState>();
 }
 
@@ -2949,22 +2949,12 @@ JSValue GlobalObject_getGlobalThis(VM& vm, JSObject* globalObject)
     return uncheckedDowncast<Zig::GlobalObject>(globalObject)->globalThis();
 }
 
-// Bun's additions to the console object that JSGlobalObject makes.
-static void addConsoleExtensions(VM& vm, Zig::GlobalObject* globalObject, JSObject* consoleObject)
-{
-    auto* clientData = WebCore::clientData(vm);
-    consoleObject->putDirectBuiltinFunction(vm, globalObject, vm.propertyNames->asyncIteratorSymbol, consoleObjectAsyncIteratorCodeGenerator(vm), PropertyAttribute::Builtin | 0);
-    consoleObject->putDirectBuiltinFunction(vm, globalObject, clientData->builtinNames().writePublicName(), consoleObjectWriteCodeGenerator(vm), PropertyAttribute::Builtin | 0);
-    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "Console"_s), CustomGetterSetter::create(vm, getConsoleConstructor, nullptr), PropertyAttribute::CustomValue | 0);
-    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stdout"_s), CustomGetterSetter::create(vm, getConsoleStdout, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
-    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stderr"_s), CustomGetterSetter::create(vm, getConsoleStderr, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
-}
-
 void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
 {
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
     m_builtinInternalFunctions->initialize(*this);
 
+    auto clientData = WebCore::clientData(vm);
     auto& builtinNames = WebCore::builtinNames(vm);
 
     // ----- Private/Static Properties -----
@@ -3089,22 +3079,14 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     errorConstructor->putDirectNativeFunction(vm, this, JSC::Identifier::fromString(vm, "appendStackTrace"_s), 2, errorConstructorFuncAppendStackTrace, ImplementationVisibility::Private, JSC::NoIntrinsic, PropertyAttribute::DontEnum | 0);
     errorConstructor->putDirectCustomAccessor(vm, JSC::Identifier::fromString(vm, "prepareStackTrace"_s), JSC::CustomGetterSetter::create(vm, errorConstructorPrepareStackTraceGetter, errorConstructorPrepareStackTraceSetter), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue);
 
-    auto consoleName = JSC::Identifier::fromString(vm, "console"_s);
-    if (m_nodeWorkerState) {
-        // A worker of node:worker_threads: the property becomes a Console over the parent's ports on
-        // its first read (NodeWorkerState). JSGlobalObject's lazy entry makes the console it is
-        // born with here, without reifying the property the slot takes the place of.
-        const HashTableValue* entry = JSGlobalObject::info()->staticPropHashTable->entry(consoleName);
-        RELEASE_ASSERT(entry && (entry->attributes() & PropertyAttribute::PropertyCallback));
-        JSC::JSObject* consoleObject = asObject(entry->lazyPropertyCallback()(vm, this));
-        addConsoleExtensions(vm, this, consoleObject);
-        m_nodeWorkerState->installConsoleSlot(vm, *this, consoleName, consoleObject);
-    } else {
-        JSC::JSObject* consoleObject = this->get(this, consoleName).getObject();
-        scope.assertNoExceptionExceptTermination();
-        RETURN_IF_EXCEPTION(scope, );
-        addConsoleExtensions(vm, this, consoleObject);
-    }
+    JSC::JSObject* consoleObject = this->get(this, JSC::Identifier::fromString(vm, "console"_s)).getObject();
+    scope.assertNoExceptionExceptTermination();
+    RETURN_IF_EXCEPTION(scope, );
+    consoleObject->putDirectBuiltinFunction(vm, this, vm.propertyNames->asyncIteratorSymbol, consoleObjectAsyncIteratorCodeGenerator(vm), PropertyAttribute::Builtin | 0);
+    consoleObject->putDirectBuiltinFunction(vm, this, clientData->builtinNames().writePublicName(), consoleObjectWriteCodeGenerator(vm), PropertyAttribute::Builtin | 0);
+    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "Console"_s), CustomGetterSetter::create(vm, getConsoleConstructor, nullptr), PropertyAttribute::CustomValue | 0);
+    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stdout"_s), CustomGetterSetter::create(vm, getConsoleStdout, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
+    consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stderr"_s), CustomGetterSetter::create(vm, getConsoleStderr, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
 }
 
 // ===================== start conditional builtin globals =====================
@@ -3288,10 +3270,9 @@ template<class Visitor, class T> static void visitGlobalObjectMember(Visitor& vi
 
 template<class Visitor, class T> static void visitGlobalObjectMember(Visitor& visitor, std::unique_ptr<T>& ptr)
 {
-    // m_builtinInternalFunctions and m_constructors are populated in the constructor
-    // initializer list, so in steady state they are never null (m_nodeWorkerState is
-    // null on every global but a node:worker_threads worker's). For those two the
-    // guard exists because the concurrent marker can visit a
+    // The two unique_ptr members (m_builtinInternalFunctions, m_constructors) are
+    // populated in the constructor initializer list, so in steady state this is
+    // never null. The guard exists because the concurrent marker can visit a
     // Zig::GlobalObject picked up via conservative stack scan while its own
     // IsoSubspace slot is being recycled from a previously-destroyed global whose
     // unique_ptr members were reset to null by ~unique_ptr(); until placement-new

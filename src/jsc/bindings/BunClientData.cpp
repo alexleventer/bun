@@ -119,7 +119,6 @@ void JSVMClientData::create(VM* vm, void* bunVM, WorkerMessagingProxy* worker)
     clientData->bunVM = bunVM;
     clientData->m_isWorkerVM = !!worker;
     clientData->m_isNodeWorkerVM = worker && worker->options().kind == WorkerOptions::Kind::Node;
-    clientData->m_nodeWorkerEnvNamesIPCChannel = clientData->m_isNodeWorkerVM && worker->options().envNamesIPCChannel;
     clientData->vmHandle = Bun__VmHandle__retain(bunVM);
     clientData->vmHandleState = Bun__VmHandle__stateAddress(clientData->vmHandle);
     vm->deferredWorkTimer->onAddPendingWork = [clientData](Ref<JSC::DeferredWorkTimer::Ticket>&& ticket, JSC::DeferredWorkTimer::WorkType kind) -> void {

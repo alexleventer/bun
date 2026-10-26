@@ -95,17 +95,14 @@ export function getStdioWriteStream(
   return [stream, underlyingSink];
 }
 
-// node:worker_threads worker: process.stdout/stderr write to the parent Worker over a
-// MessagePort; process.stdin reads from one for { stdin: true }, else is already ended.
-// For stdout and stderr the result is [stream, flush]: the stream's process 'exit' listener is
-// native (BunProcess.cpp) and calls `flush` (NodeWorkerState::flushStdio).
+// process.stdin (0), stdout (1) or stderr (2) of a node:worker_threads worker, over its port to the parent Worker. For 1 and 2: [stream, what completes its waiting writev, what the console writes to it with] (NodeWorkerState::stdioStream).
 export function getNodeWorkerStdioStream(fd: number, port: MessagePort | undefined) {
   const stdio = require("internal/worker/stdio");
   if (fd === 0) {
     return port ? stdio.makePortReadable(port, true) : stdio.makeEndedReadable();
   }
   const stream = stdio.makePortWritable(port!);
-  return [stream, stream[stdio.kFlushSync]];
+  return [stream, stream[stdio.kFlushSync], stdio.makeConsoleWriter(stream)];
 }
 
 export function getStdinStream(
