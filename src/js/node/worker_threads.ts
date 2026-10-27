@@ -340,7 +340,7 @@ const { makePortReadable, makePortWritable } = require("internal/worker/stdio");
 // A plain string key on purpose: Symbols don't survive structured clone, and
 // Bun has no native HostObject hook, so the marker must ride along inside the
 // cloned graph (including Map/Set entries). This is in-band signaling: a user
-// object that fabricates the key in workerData will deserialize on the worker
+// object that fabricates the key in a workerData that also transfers a FileHandle will deserialize on the worker
 // side where node would deliver it unchanged. That's accepted - it is not a
 // privilege boundary (worker threads share the parent's fd table anyway).
 const kJSTransferableMarker = "__bunNodeWorkerJSTransferable";
@@ -792,6 +792,8 @@ class Worker extends EventEmitter {
         name: this.#name,
         // Always present, so the constructor never reads its `data` alias for a node worker.
         workerData: options.workerData,
+        // Read here as node reads it: an inherited or non-enumerable list counts, and a falsy one is no list.
+        transferList: options.transferList || undefined,
       };
 
       // env: SHARE_ENV becomes a native boolean flag so it passes native option
@@ -850,8 +852,7 @@ class Worker extends EventEmitter {
     this.#worker.addEventListener("open", this.#onOpen.bind(this), {
       once: true,
     });
-    // Messages from parentPort.postMessage() arrive on the public port. Listening
-    // starts the port. Node's setupPortReferencing: the port counts toward the
+    // Messages from parentPort.postMessage() arrive on the public port. Node's setupPortReferencing: the port counts toward the
     // parent's liveness only while this Worker has 'message' listeners (and
     // ref()/unref() also touch it, together with the handle).
     this.#publicPort.addEventListener("message", this.#onMessage.bind(this));
@@ -1077,8 +1078,15 @@ class Worker extends EventEmitter {
       this.#stdin.destroy();
     }
     this.#stdinPort?.close();
-    // Nothing is queued here: the port is started before the thread, so it delivered what the worker posted ahead of this task.
-    this.#publicPort.close();
+    // node delivers everything the worker posted before it exited ahead of
+    // 'exit' (kOnExit drains the public port), then closes the port.
+    {
+      let entry;
+      while ((entry = _receiveMessageOnPort(this.#publicPort)) !== undefined) {
+        this.emit("message", entry.message);
+      }
+      this.#publicPort.close();
+    }
     this.#onExitPromise = e.code;
     this.emit("exit", e.code);
   }

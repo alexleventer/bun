@@ -20,7 +20,6 @@ enum class JSPromiseRejectionOperation : unsigned;
 } // namespace JSC
 
 namespace WebCore {
-class MessagePort;
 class ScriptExecutionContext;
 class DOMGuardedObject;
 class EventLoopTask;
@@ -496,7 +495,7 @@ public:
     V(public, JSC::WriteBarrier<Bun::HandleScopeImpl>, m_currentHandleScopeImpl)                             \
                                                                                                              \
     /* Supports getEnvironmentData() and setEnvironmentData(), and is cloned into newly-created */           \
-    /* Workers. Initialized in createNodeWorkerThreadsBinding. */                                            \
+    /* Workers. Set by a node worker's start sequence, else in createNodeWorkerThreadsBinding. */            \
     V(private, WriteBarrier<JSMap>, m_nodeWorkerEnvironmentData)                                             \
     /* The default global of a worker that node:worker_threads made; null on every other global. */          \
     V(private, std::unique_ptr<Bun::NodeWorkerState>, m_nodeWorkerState)                                     \

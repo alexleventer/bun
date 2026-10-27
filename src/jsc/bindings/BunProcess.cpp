@@ -1858,7 +1858,7 @@ static JSValue constructLoadEnvFile(VM& vm, JSObject* processObject)
 
 // Lazy PropertyCallback builders that enter JS. reifyAllStaticProperties wraps these in
 // DeferTerminationForAWhile; a non-termination throw is cleared+reported so the worker's
-// reifyAllStaticProperties (node:worker_threads preload) doesn't leave a pending exception.
+// reifyAllStaticProperties doesn't leave a pending exception.
 static JSValue callLazyProcessBuilder(VM& vm, JSC::JSGlobalObject* globalObject, JSC::FunctionExecutable* (*generator)(VM&), const JSC::ArgList& args)
 {
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
@@ -5210,10 +5210,14 @@ JSC_DEFINE_CUSTOM_GETTER(nodeWorkerStderr, (JSGlobalObject * globalObject, JSC::
 static void installNodeWorkerProcessSurface(JSC::VM& vm, Process* process)
 {
     auto* globalObject = defaultGlobalObject(process->globalObject());
+    auto* nodeWorker = globalObject->nodeWorkerState();
 
-    process->putDirectCustomAccessor(vm, Identifier::fromString(vm, "stdin"_s), JSC::CustomGetterSetter::create(vm, nodeWorkerStdin, nullptr), PropertyAttribute::CustomValue | 0);
-    process->putDirectCustomAccessor(vm, Identifier::fromString(vm, "stdout"_s), JSC::CustomGetterSetter::create(vm, nodeWorkerStdout, nullptr), PropertyAttribute::CustomValue | 0);
-    process->putDirectCustomAccessor(vm, Identifier::fromString(vm, "stderr"_s), JSC::CustomGetterSetter::create(vm, nodeWorkerStderr, nullptr), PropertyAttribute::CustomValue | 0);
+    // A worker with no channels to a parent Worker (NodeWorkerState::takeFromParent) keeps the stdio of the process.
+    if (nodeWorker->port(WebCore::WorkerOptions::Stdout)) {
+        process->putDirectCustomAccessor(vm, Identifier::fromString(vm, "stdin"_s), JSC::CustomGetterSetter::create(vm, nodeWorkerStdin, nullptr), PropertyAttribute::CustomValue | 0);
+        process->putDirectCustomAccessor(vm, Identifier::fromString(vm, "stdout"_s), JSC::CustomGetterSetter::create(vm, nodeWorkerStdout, nullptr), PropertyAttribute::CustomValue | 0);
+        process->putDirectCustomAccessor(vm, Identifier::fromString(vm, "stderr"_s), JSC::CustomGetterSetter::create(vm, nodeWorkerStderr, nullptr), PropertyAttribute::CustomValue | 0);
+    }
 
     // An own property: the accessor's setter writes a process-global shared across threads.
     process->putDirect(vm, Identifier::fromString(vm, "debugPort"_s), jsNumber(9229), 0);
@@ -5239,7 +5243,7 @@ static void installNodeWorkerProcessSurface(JSC::VM& vm, Process* process)
 #endif
 
     // Node disables the IPC surface only in a worker whose env names a channel. Decided when the worker started: this runs on the first use of `process`, which can be inside user code.
-    if (!globalObject->nodeWorkerState()->envNamesIpcChannel())
+    if (!nodeWorker->envNamesIpcChannel())
         return;
     disable("send"_s);
     disable("disconnect"_s);

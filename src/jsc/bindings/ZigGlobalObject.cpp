@@ -5,7 +5,6 @@
 #include "BunModuleRegistry.h"
 #include "BuiltinModuleKeys.h"
 #include "IsolatedModuleCache.h"
-#include "MessagePort.h"
 #include "helpers.h"
 #include "JavaScriptCore/ArgList.h"
 #include "JavaScriptCore/JSCellButterfly.h"
@@ -650,13 +649,13 @@ extern "C" JSC::JSGlobalObject* Zig__GlobalObject__create(void* console_client, 
         const auto initializeWorker = [&](WebCore::WorkerMessagingProxy& worker) -> void {
             auto& options = worker.options();
 
-            // What `process.env.NODE_CHANNEL_FD` is when this worker starts. An env that the worker inherits has none: the env loader takes none from the process's environment (is_ipc_channel_key).
-            bool envNamesIpcChannel = false;
+            auto* nodeWorker = globalObject->nodeWorkerState();
             if (options.env.has_value()) {
                 auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
                 HashMap<String, String> map = *std::exchange(options.env, std::nullopt);
                 auto size = map.size();
-                envNamesIpcChannel = !map.get(String("NODE_CHANNEL_FD"_s)).isEmpty();
+                if (nodeWorker)
+                    nodeWorker->setOwnEnvAtStart(!map.get(String("NODE_CHANNEL_FD"_s)).isEmpty(), map.contains(String("FORCE_COLOR"_s)));
 
                 // In theory, a GC could happen before we finish putting all the properties on the object.
                 // So we use a MarkedArgumentBuffer to ensure that the strings are not collected and we immediately put them on the object.
@@ -692,12 +691,11 @@ extern "C" JSC::JSGlobalObject* Zig__GlobalObject__create(void* console_client, 
                 // resolved. Consumed like options.env, and published on the context
                 // before the view, which resolves its store through the context.
                 RefPtr<Bun::SharedEnvStore> store = std::exchange(options.sharedEnvStore, nullptr);
-                envNamesIpcChannel = !store->get("NODE_CHANNEL_FD"_s).isEmpty();
+                if (nodeWorker)
+                    nodeWorker->setOwnEnvAtStart(!store->get("NODE_CHANNEL_FD"_s).isEmpty(), !store->get("FORCE_COLOR"_s).isNull());
                 globalObject->scriptExecutionContext()->setSharedEnvStore(*store);
                 globalObject->m_processEnvObject.set(vm, globalObject, Bun::createSharedEnvironmentVariablesMap(globalObject).getObject());
             }
-            if (auto* nodeWorker = globalObject->nodeWorkerState())
-                nodeWorker->setEnvNamesIpcChannel(envNamesIpcChannel);
 
             // Ensure that the TerminationException singleton is constructed. Workers need this so
             // that we can request their termination from another thread. For the main thread, we
@@ -3272,14 +3270,12 @@ template<class Visitor, class T> static void visitGlobalObjectMember(Visitor& vi
 
 template<class Visitor, class T> static void visitGlobalObjectMember(Visitor& visitor, std::unique_ptr<T>& ptr)
 {
-    // The two unique_ptr members (m_builtinInternalFunctions, m_constructors) are
-    // populated in the constructor initializer list, so in steady state this is
-    // never null. The guard exists because the concurrent marker can visit a
+    // m_nodeWorkerState is null on every global but the default one of a node:worker_threads worker. m_builtinInternalFunctions and m_constructors are set in the constructor's initializer list: they read as null only because the concurrent marker can visit a
     // Zig::GlobalObject picked up via conservative stack scan while its own
     // IsoSubspace slot is being recycled from a previously-destroyed global whose
     // unique_ptr members were reset to null by ~unique_ptr(); until placement-new
     // re-initializes them there is a brief window where the pointer reads as null.
-    if (ptr) [[likely]]
+    if (ptr)
         ptr->visit(visitor);
 }
 

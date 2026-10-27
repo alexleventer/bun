@@ -95,12 +95,9 @@ export function getStdioWriteStream(
   return [stream, underlyingSink];
 }
 
-// process.stdin (0), stdout (1) or stderr (2) of a node:worker_threads worker, over its port to the parent Worker. For 1 and 2: [stream, what completes its waiting writev, what the console writes to it with] (NodeWorkerState::stdioStream).
-export function getNodeWorkerStdioStream(fd: number, port: MessagePort | undefined) {
-  const stdio = require("internal/worker/stdio");
-  const stream = stdio.makeWorkerProcessStream(fd, port);
-  if (fd === 0) return stream;
-  return [stream, stream[stdio.kFlushSync], stdio.makeConsoleWriter(stream as import("node:stream").Writable)];
+// NodeWorkerState::stdioStream: process.stdin (0), stdout (1) or stderr (2) of a node:worker_threads worker, over its port to the parent Worker.
+export function getNodeWorkerStdioStream(fd: number, port: MessagePort | undefined, awaitsConsoleAck: boolean) {
+  return require("internal/worker/stdio").makeWorkerProcessStream(fd, port, awaitsConsoleAck);
 }
 
 export function getStdinStream(

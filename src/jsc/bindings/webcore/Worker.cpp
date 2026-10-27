@@ -28,7 +28,6 @@
 #include "Worker.h"
 
 #include "AddEventListenerOptions.h"
-#include "InternalModuleRegistry.h"
 #include "ErrorCode.h"
 #include "ErrorEvent.h"
 #include "Event.h"
@@ -376,8 +375,7 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionListenOnHubPort, (JSGlobalObject * lexicalGlo
         return JSValue::encode(jsUndefined());
     JSValue wrapper = toJS(globalObject, globalObject, *port);
     RETURN_IF_EXCEPTION(scope, {});
-    nodeWorker->stopListening(WorkerOptions::Hub);
-    static_cast<EventTarget&>(*port).addEventListener(eventNames().messageEvent, JSEventListener::create(*listener, *asObject(wrapper), false, globalObject->world()), {});
+    nodeWorker->listen(WorkerOptions::Hub, JSEventListener::create(*listener, *asObject(wrapper), false, globalObject->world()));
     return JSValue::encode(jsUndefined());
 }
 

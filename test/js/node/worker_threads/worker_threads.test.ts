@@ -3686,17 +3686,18 @@ describe("node worker start sequence", () => {
       expect(exitCode).toBe(0);
     });
 
-    // The worker's streams are not TTYs. As in Node, FORCE_COLOR still colors what goes to them.
+    // The worker's streams are not TTYs. As for the Console of node:console, FORCE_COLOR in the worker's env still colors what goes to them.
     test.each([
-      ["has colors with FORCE_COLOR", "1", true],
-      ["has no colors without it", undefined, false],
-    ])("%s", async (_label, FORCE_COLOR, colored) => {
+      ["has colors when the worker's env names FORCE_COLOR", "1", "{}", true],
+      ["has no colors when the process has none", undefined, "{}", false],
+      ["has no colors when the worker's env does not name FORCE_COLOR", "1", "{ env: {} }", false],
+    ])("%s", async (_label, FORCE_COLOR, options, colored) => {
       await using proc = Bun.spawn({
         cmd: [
           bunExe(),
           "-e",
           `const { Worker } = require("node:worker_threads");
-           const worker = new Worker('console.log("log", { a: 1 }); console.table([{ x: 1 }]); console.count(); console.trace("trace"); console.error({ b: 2 }); console.time("t"); console.timeEnd("t"); console.assert(false)', { eval: true, stdout: true, stderr: true });
+           const worker = new Worker('console.log("log", { a: 1 }); console.table([{ x: 1 }]); console.count(); console.trace("trace"); console.error({ b: 2 }); console.time("t"); console.timeEnd("t"); console.assert(false)', { eval: true, stdout: true, stderr: true, ...${options} });
            const output = { stdout: "", stderr: "" };
            worker.stdout.setEncoding("utf8").on("data", chunk => (output.stdout += chunk));
            worker.stderr.setEncoding("utf8").on("data", chunk => (output.stderr += chunk));
@@ -3721,37 +3722,179 @@ describe("node worker start sequence", () => {
       expect(exitCode).toBe(0);
     });
 
-    // Node's Console does the same (ignoreErrors).
-    test("drops what a broken process.stdout does not take, and does not throw", async () => {
+    // What node's Console does with a stream (kWriteToConsole with ignoreErrors). Each row is also what node prints.
+    describe("writes to the stream as the Console of node:console does", () => {
+      async function run(source: string) {
+        const worker = new Worker(source, { eval: true, stdout: true, stderr: true });
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        const errors: string[] = [];
+        worker.stdout.setEncoding("utf8").on("data", chunk => stdout.push(chunk));
+        worker.stderr.setEncoding("utf8").on("data", chunk => stderr.push(chunk));
+        worker.on("error", error => errors.push(String(error?.message)));
+        const exited = once(worker, "exit");
+        const message = once(worker, "message").then(([value]) => value);
+        const [exitCode] = await exited;
+        return { stdout, stderr, errors, exitCode, message: exitCode === 0 ? await message : undefined };
+      }
+      const post = `require("node:worker_threads").parentPort.postMessage`;
+
+      test("the stream it has, when process.stdout is replaced", async () => {
+        const result = await run(`
+          console.log("1 before process.stdout exists");
+          const stdout = process.stdout;
+          process.stdout = { write() { throw new Error("not this one"); } };
+          console.log("2 to the stream the worker was given");
+          process.stdout = stdout;
+          ${post}("done");`);
+        expect(result).toEqual({
+          stdout: ["1 before process.stdout exists\n", "2 to the stream the worker was given\n"],
+          stderr: [],
+          errors: [],
+          exitCode: 0,
+          message: "done",
+        });
+      });
+
+      test("a replaced write() gets a string and a callback", async () => {
+        const result = await run(`
+          const seen = [];
+          const original = process.stdout.write;
+          process.stdout.write = function (chunk, callback) { seen.push([typeof chunk, typeof callback, chunk, arguments.length]); return true; };
+          console.log("hello");
+          console.info("%s!", "formatted");
+          process.stdout.write = original;
+          ${post}(seen);`);
+        expect(result).toEqual({
+          stdout: [],
+          stderr: [],
+          errors: [],
+          exitCode: 0,
+          message: [
+            ["string", "function", "hello\n", 2],
+            ["string", "function", "formatted!\n", 2],
+          ],
+        });
+      });
+
+      test("what write() throws is not the caller's", async () => {
+        const result = await run(`
+          const stdout = process.stdout;
+          stdout.write = () => { throw new Error("write threw"); };
+          let threw = false;
+          try { console.log("dropped"); console.count("dropped"); console.error("to stderr"); } catch { threw = true; }
+          delete stdout.write;
+          console.log("after");
+          ${post}({ threw });`);
+        expect(result).toEqual({
+          stdout: ["after\n"],
+          stderr: ["to stderr\n"],
+          errors: [],
+          exitCode: 0,
+          message: { threw: false },
+        });
+      });
+
+      test("a stack overflow in write() is the caller's", async () => {
+        const result = await run(`
+          let calls = 0;
+          const original = process.stdout.write;
+          process.stdout.write = function () { calls++; console.log("first"); console.log("second"); return true; };
+          let thrown = "nothing";
+          try { console.log("start"); } catch (error) { thrown = error.name; }
+          process.stdout.write = original;
+          ${post}({ thrown, deep: calls > 100 });`);
+        expect(result).toEqual({
+          stdout: [],
+          stderr: [],
+          errors: [],
+          exitCode: 0,
+          message: { thrown: "RangeError", deep: true },
+        });
+      });
+
+      test("after end() the stream reports the write, and the console does not throw", async () => {
+        const result = await run(`
+          const seen = [];
+          process.stdout.on("error", error => seen.push("error " + error.code));
+          console.log("before 1");
+          console.log("before 2");
+          process.stdout.end("end\\n");
+          let threw = false;
+          try { console.log("after end"); } catch { threw = true; }
+          setImmediate(() => ${post}({ threw, seen, destroyed: process.stdout.destroyed }));`);
+        expect(result).toEqual({
+          stdout: ["before 1\n"],
+          stderr: [],
+          errors: [],
+          exitCode: 0,
+          message: { threw: false, seen: ["error ERR_STREAM_WRITE_AFTER_END"], destroyed: true },
+        });
+      });
+
+      test("an error of the stream with no 'error' listener does not end the worker", async () => {
+        const result = await run(`
+          process.stderr._writev = (chunks, callback) => callback(new Error("sink failed"));
+          console.error("lost");
+          setImmediate(() => ${post}(process.stderr.destroyed));`);
+        expect(result).toEqual({ stdout: [], stderr: [], errors: [], exitCode: 0, message: true });
+      });
+
+      test("after destroy() the console does not throw", async () => {
+        const result = await run(`
+          process.stdout.end();
+          console.log("after end");
+          process.stderr.destroy();
+          console.error("after destroy");
+          console.timeEnd("never started");
+          setImmediate(() => ${post}([process.stdout.destroyed, process.stderr.destroyed]));`);
+        expect(result).toEqual({ stdout: [], stderr: [], errors: [], exitCode: 0, message: [true, true] });
+      });
+    });
+
+    // One 'data' event of worker.stdout for each console call, as for each write() of a stream.
+    test("keeps the output of each call a chunk of its own", async () => {
       const worker = new Worker(
-        `console.log("1 before process.stdout exists");
-         const stdout = process.stdout;
-         process.stdout = { write() { throw new Error("not this one"); } };
-         console.log("2 to the stream the worker was given");
-         process.stdout = stdout;
-         stdout.write = () => { throw new Error("write threw"); };
-         let threw = false;
-         try { console.log("dropped"); console.count("dropped"); } catch { threw = true; }
-         delete stdout.write;
-         stdout.end();
-         try { console.log("dropped after end"); } catch { threw = true; }
-         process.stderr.destroy();
-         try { console.error("dropped after destroy"); console.timeEnd("never started"); } catch { threw = true; }
-         require("node:worker_threads").parentPort.postMessage(threw);`,
+        `console.log("line 1"); console.log("line 2"); console.log("line 3");
+         console.error("error 1"); console.error("error 2");
+         setImmediate(() => { console.log("line 4"); console.log("line 5"); console.log("line 6"); });`,
         { eval: true, stdout: true, stderr: true },
       );
-      let stdout = "";
-      let stderr = "";
-      worker.stdout.setEncoding("utf8").on("data", chunk => (stdout += chunk));
-      worker.stderr.setEncoding("utf8").on("data", chunk => (stderr += chunk));
-      const exited = once(worker, "exit");
-      expect(await once(worker, "message")).toEqual([false]);
-      const [exitCode] = await exited;
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      worker.stdout.setEncoding("utf8").on("data", chunk => stdout.push(chunk));
+      worker.stderr.setEncoding("utf8").on("data", chunk => stderr.push(chunk));
+      const [exitCode] = await once(worker, "exit");
       expect({ stdout, stderr, exitCode }).toEqual({
-        stdout: "1 before process.stdout exists\n2 to the stream the worker was given\n",
-        stderr: "",
+        stdout: ["line 1\n", "line 2\n", "line 3\n", "line 4\n", "line 5\n", "line 6\n"],
+        stderr: ["error 1\n", "error 2\n"],
         exitCode: 0,
       });
+    });
+
+    // A node:vm timeout that lands in a console call must not leave the console waiting for an ack of output that never left.
+    test("goes on after a node:vm timeout that lands in a call", async () => {
+      const worker = new Worker(
+        `const { parentPort } = require("node:worker_threads");
+         console.log("first");
+         parentPort.once("message", () => {
+           const big = Buffer.alloc(8 << 20, "x").toString();
+           try {
+             require("node:vm").runInNewContext("console.log(big)", { console, big }, { timeout: 1 });
+           } catch {}
+           console.log("after");
+         });`,
+        { eval: true, stdout: true },
+      );
+      let stdout = "";
+      const exited = once(worker, "exit");
+      // The reader acks a chunk on the tick after it took it, so the worker's console is idle when this message arrives.
+      worker.stdout.setEncoding("utf8").on("data", chunk => {
+        if (stdout === "") setImmediate(() => worker.postMessage("go"));
+        stdout += chunk;
+      });
+      const [exitCode] = await exited;
+      expect({ first: stdout.slice(0, 6), exitCode }).toEqual({ first: "first\n", exitCode: 0 });
     });
 
     // Node evaluates its builtins before user code. The console of a worker needs none here.
@@ -3886,6 +4029,148 @@ describe("node worker start sequence", () => {
     });
   });
 
+  // node's flow control (lib/internal/worker/io.js): a write completes when the parent's reader asks for more.
+  describe("process.stdout waits for the parent's reader", () => {
+    const megabyte = 1 << 20;
+    const report = `parentPort.postMessage({ wrote, drained, waiting: process.stdout.writableLength >= ${megabyte} })`;
+
+    // What the worker says once the parent holds `bytes` of worker.stdout that nothing reads.
+    async function stateWithUnread(worker: Worker, bytes: number) {
+      while (worker.stdout.readableLength < bytes) await new Promise(resolve => setImmediate(resolve));
+      const reply = once(worker, "message");
+      worker.postMessage("state");
+      const [state] = await reply;
+      await worker.terminate();
+      return state;
+    }
+
+    // The stream takes over the batch that the console has in flight, and what the console has waiting behind it.
+    test.each([1, 2, 3])("after %d console calls and a first read of process.stdout", async calls => {
+      const worker = new Worker(
+        `const { parentPort } = require("node:worker_threads");
+         let wrote = false, drained = false;
+         for (let i = 0; i < ${calls}; i++) console.log("x");
+         process.stdout.write(Buffer.alloc(${megabyte}, 0x61), () => { wrote = true; });
+         process.stdout.once("drain", () => { drained = true; });
+         parentPort.on("message", () => ${report});`,
+        { eval: true, stdout: true },
+      );
+      expect(await stateWithUnread(worker, megabyte + 2 * calls)).toEqual({
+        wrote: false,
+        drained: false,
+        waiting: true,
+      });
+    });
+
+    // A 'readable' listener makes the parent's reader ask once, ahead of any output. That is no ack of what the worker writes later.
+    test("when the parent's reader asked before the worker wrote", async () => {
+      const worker = new Worker(
+        `const { parentPort } = require("node:worker_threads");
+         let wrote = false, drained = false;
+         parentPort.on("message", message => {
+           if (message === "state") return ${report};
+           process.stdout.write(Buffer.alloc(${megabyte}, 0x61), () => { wrote = true; });
+           process.stdout.once("drain", () => { drained = true; });
+         });`,
+        { eval: true, stdout: true },
+      );
+      worker.stdout.on("readable", () => {});
+      worker.postMessage("write");
+      expect(await stateWithUnread(worker, megabyte)).toEqual({ wrote: false, drained: false, waiting: true });
+    });
+  });
+
+  // The streams and node:events are evaluated at the first use, in the realm as user code left it.
+  describe("after Object.freeze(Object.prototype)", () => {
+    test("process.stdout, stderr and stdin work", async () => {
+      const result = await runWorker(`
+        Object.freeze(Object.prototype);
+        process.stdout.write("stdout\\n");
+        process.stderr.write("stderr\\n");
+        process.stdin.on("data", () => {}).on("end", () => process.stdout.write("stdin end\\n"));
+      `);
+      expect(result).toEqual({ stdout: "stdout\nstdin end\n", stderr: "stderr\n", exitCode: 0 });
+    });
+
+    test("a { stdin: true } worker that does not read process.stdin takes what the parent writes", async () => {
+      const worker = new Worker(
+        `Object.freeze(Object.prototype); console.log("frozen"); setInterval(() => {}, 1 << 30);`,
+        { eval: true, stdin: true, stdout: true },
+      );
+      const errors: unknown[] = [];
+      worker.on("error", error => errors.push(String(error)));
+      await once(worker.stdout, "data");
+      const { promise, resolve } = Promise.withResolvers<Error | null | undefined>();
+      worker.stdin!.write("unread", resolve);
+      const outcome = await Promise.race([
+        promise.then(error => error ?? "written"),
+        once(worker, "exit").then(([code]) => `exit ${code}`),
+      ]);
+      await worker.terminate();
+      expect({ outcome, errors }).toEqual({ outcome: "written", errors: [] });
+    });
+  });
+
+  describe("transferList", () => {
+    test.each([false, 0, "", null, undefined])("%p is no list", async transferList => {
+      const worker = new Worker(`require("node:worker_threads").parentPort.postMessage("started");`, {
+        eval: true,
+        // @ts-expect-error
+        transferList,
+      });
+      expect(await once(worker, "message")).toEqual(["started"]);
+      await once(worker, "exit");
+    });
+
+    test("is read as a property, not copied as an own one", async () => {
+      const buffer = new ArrayBuffer(16);
+      const options = Object.create({ transferList: [buffer] });
+      options.eval = true;
+      options.workerData = buffer;
+      const worker = new Worker(
+        `const { parentPort, workerData } = require("node:worker_threads"); parentPort.postMessage(workerData.byteLength);`,
+        options,
+      );
+      expect(buffer.byteLength).toBe(0);
+      expect(await once(worker, "message")).toEqual([16]);
+      await once(worker, "exit");
+    });
+  });
+
+  // The worker has no channels to a parent then. Its thread can still run until the context's stop reaches it.
+  test("a worker made in a Bun.ModuleGraph context that was disposed has the process's stdio", async () => {
+    using dir = tempDir("worker-disposed-graph", {});
+    const marker = join(String(dir), "worker-ran");
+    const entry = `require("node:fs").writeFileSync(${JSON.stringify(marker)}, [typeof process.stdout.write, typeof process.stderr.write, typeof process.stdin.on, typeof console.log].join(" "));`;
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const { Worker } = require("node:worker_threads");
+         const { AsyncLocalStorage } = require("node:async_hooks");
+         const fs = require("node:fs");
+         const graph = new Bun.ModuleGraph();
+         const inGraph = graph.run(() => AsyncLocalStorage.snapshot());
+         graph.dispose();
+         inGraph(() => new Worker(${JSON.stringify(entry)}, { eval: true }));
+         // The parent stays off its loop, where the stop of the worker waits, until the worker ran.
+         const wait = new Int32Array(new SharedArrayBuffer(4));
+         const deadline = Date.now() + 60_000;
+         while (!fs.existsSync(${JSON.stringify(marker)}) && Date.now() < deadline) Atomics.wait(wait, 0, 0, 10);
+         console.log(fs.readFileSync(${JSON.stringify(marker)}, "utf8"));`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout: "function function function function\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
   describe("a synchronous exit", () => {
     test("writes what waits for the parent ahead of the 'exit' listeners", async () => {
       const result = await runWorker(`
@@ -3968,6 +4253,26 @@ describe("node worker start sequence", () => {
       await postMessageToThread(worker.threadId, "last");
       await exited;
       expect(stdout).toBe(`["first",0]\n["last",0]\n`);
+    });
+
+    test("a port that comes with a message has on() in a worker that never loaded node:worker_threads", async () => {
+      const worker = new Worker(
+        `const keepAlive = setInterval(() => {}, 1 << 30);
+         process.on("workerMessage", ({ port }) => {
+           clearInterval(keepAlive);
+           port.on("message", message => {
+             port.postMessage("echo " + message);
+             port.close();
+           });
+         });`,
+        { eval: true },
+      );
+      const { port1, port2 } = new MessageChannel();
+      const reply = once(port1, "message");
+      await postMessageToThread(worker.threadId, { port: port2 }, [port2]);
+      port1.postMessage("hello");
+      expect(await reply).toEqual(["echo hello"]);
+      await once(worker, "exit");
     });
 
     test("rejects when the worker has no 'workerMessage' listener", async () => {

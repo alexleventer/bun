@@ -34,45 +34,59 @@ public:
 
     WebCore::MessagePort* port(NodePort which) const { return m_ports[which].get(); }
     JSC::JSValue workerData() const { return m_workerData.get(); }
-    // Whether the worker's env had a NODE_CHANNEL_FD when the worker started. Node then disables the IPC surface of `process`.
+
+    // What an env that `new Worker` copied or shares names when the worker starts. A worker that inherits the process's env does not call this.
+    void setOwnEnvAtStart(bool namesIpcChannel, bool namesForceColor)
+    {
+        m_hasOwnEnv = true;
+        m_envNamesIpcChannel = namesIpcChannel;
+        m_ownEnvNamesForceColor = namesForceColor;
+    }
+    // Node then disables the IPC surface of `process`. An inherited env has no NODE_CHANNEL_FD: the env loader takes none from the process's environment (is_ipc_channel_key).
     bool envNamesIpcChannel() const { return m_envNamesIpcChannel; }
-    void setEnvNamesIpcChannel(bool value) { m_envNamesIpcChannel = value; }
 
     // process.stdin (0), stdout (1) or stderr (2). A build that throws is not remembered: the next call builds again.
     JSC::JSValue stdioStream(Zig::GlobalObject&, unsigned fd);
-    // One console call's output for fd 1 or 2. It goes through process.stdout / stderr once the worker has built that, and from here to the same port until then.
+    // One console call's output for fd 1 or 2, as UTF-8. It goes through process.stdout / stderr once the worker has built that, and from here to the same port until then. Throws only what that stream's writer lets through (a stack overflow).
     void writeConsole(Zig::GlobalObject&, unsigned fd, std::span<const uint8_t>);
     // node's flushSync: a synchronous exit leaves no loop turn for the parent's ack, so what waits for one is posted now.
     void flushStdioForExit(Zig::GlobalObject&);
 
-    void stopListening(NodePort);
-    void didReceiveMessage(Zig::GlobalObject&, NodePort, WebCore::ScriptExecutionContext&, WebCore::Event&);
+    // `listener` takes the place of what listens on the port for this object.
+    void listen(NodePort, Ref<WebCore::EventListener>&& listener);
+    void didReceiveMessage(Zig::GlobalObject&, NodePort, WebCore::EventListener& receiver, WebCore::ScriptExecutionContext&, WebCore::Event&);
 
     template<typename Visitor> void visit(Visitor&);
 
 private:
-    void listen(NodePort);
-    void postConsoleOutput(Zig::GlobalObject&, unsigned fd, std::span<const uint8_t>);
-    // Posts what waits for an ack without one, and stops waiting.
-    void releaseConsoleQueue(Zig::GlobalObject&, unsigned fd);
-
     // The flow control of internal/worker/stdio: one batch is in flight, and what is written meanwhile waits for the reader's ack.
     struct ConsoleQueue {
-        Vector<uint8_t> waiting;
+        // What waits, and where the output of each console call ends in it: the reader gets one chunk for each call.
+        Vector<uint8_t> bytes;
+        Vector<size_t> ends;
         bool isAwaitingAck { false };
     };
 
+    void stopListening(NodePort);
+    // Whether the batch is with the port. Leaves no exception pending.
+    bool postConsoleOutput(Zig::GlobalObject&, unsigned fd, std::span<const uint8_t> bytes, std::span<const size_t> ends);
+    // Posts what waits for an ack without one, and stops waiting.
+    void releaseConsoleQueue(Zig::GlobalObject&, unsigned fd);
+    void writeConsoleToStream(Zig::GlobalObject&, JSC::JSObject* write, std::span<const uint8_t>);
+
     std::array<RefPtr<WebCore::MessagePort>, NodePort::NodePortCount> m_ports;
-    // On a port until the worker builds what reads it: for the first message to stdin or from the postMessageToThread hub, and for the acks of console output.
+    // What listens on a port for this object: its own listener until the worker builds what reads the port, and on the hub port then the listener of internal/worker/messaging.
     std::array<RefPtr<WebCore::EventListener>, NodePort::NodePortCount> m_listeners;
     std::array<ConsoleQueue, 2> m_consoleQueues;
     bool m_entrySettled { false };
     bool m_isExiting { false };
+    bool m_hasOwnEnv { false };
     bool m_envNamesIpcChannel { false };
+    bool m_ownEnvNamesForceColor { false };
 
     JSC::WriteBarrier<JSC::Unknown> m_workerData;
     std::array<JSC::WriteBarrier<JSC::JSObject>, 3> m_stdioStreams;
-    // Of process.stdout and stderr (internal/worker/stdio): what completes the writev that waits for an ack, and what writes console output to the stream.
+    // Of process.stdout and stderr (internal/worker/stdio): what completes the batch in flight without the reader's ack, and what writes console output to the stream.
     std::array<JSC::WriteBarrier<JSC::JSObject>, 2> m_stdioFlush;
     std::array<JSC::WriteBarrier<JSC::JSObject>, 2> m_consoleWrite;
 };

@@ -33,12 +33,8 @@ const {
   ((listener: (event: MessageEvent) => void) => void) | undefined,
 ];
 
-// Only the main thread (the hub) has one.
-// SafeMap: its prototype is a frozen null-proto snapshot taken at bootstrap, so the
-// cross-thread routing table can't be broken by user code replacing Map.prototype.
-const threadsPorts: Map<number, import("node:worker_threads").MessagePort> = isMainThread
-  ? new (require("internal/primordials").SafeMap)()
-  : undefined!;
+// The hub's routing table. An intrinsic Map read through its private methods: user code that replaced Map or its prototype before this module loaded does not reach it.
+const threadsPorts = new $Map<number, import("node:worker_threads").MessagePort>();
 
 // SharedArrayBuffer must always be Int32, so it's * 4.
 // One slot for the operation status (performing / performed) and one for the result.
@@ -58,7 +54,7 @@ function handleMessageFromThread(message) {
       const { threadId, port } = message;
 
       // Register the port.
-      threadsPorts.set(threadId, port);
+      threadsPorts.$set(threadId, port);
 
       // Handle messages on this port. When another thread wants to register a
       // child, this takes care of relaying it, so any thread links to the main one.
@@ -68,7 +64,7 @@ function handleMessageFromThread(message) {
       // whose intermediate parent was terminated, so that parent's Worker#onClose
       // never ran); otherwise the stale entry lingers in the hub forever.
       port.on("close", () => {
-        if (threadsPorts.get(threadId) === port) threadsPorts.delete(threadId);
+        if (threadsPorts.$get(threadId) === port) threadsPorts.$delete(threadId);
       });
 
       // Never block the thread on this port.
@@ -76,10 +72,10 @@ function handleMessageFromThread(message) {
       break;
     }
     case messageTypes.UNREGISTER_MAIN_THREAD_PORT: {
-      const port = threadsPorts.get(message.threadId);
+      const port = threadsPorts.$get(message.threadId);
       if (port) {
         port.close();
-        threadsPorts.delete(message.threadId);
+        threadsPorts.$delete(message.threadId);
       }
       break;
     }
@@ -107,7 +103,7 @@ function sendMessageToWorker(source, destination, value, transferList, memory) {
   }
 
   // Find the port to the target thread.
-  const port = threadsPorts.get(destination);
+  const port = threadsPorts.$get(destination);
 
   if (!port) {
     const status = new Int32Array(memory);
@@ -201,7 +197,13 @@ function destroyMainThreadPort(threadId: number) {
 }
 
 // As in node, a worker gets nothing from the hub before its entry module has evaluated: the port holds its start until then (MessagePort::holdStartUntilEntrySettled).
-if (listenOnMainThreadPort) listenOnMainThreadPort(event => handleMessageFromMainThread(event.data));
+if (listenOnMainThreadPort) {
+  listenOnMainThreadPort(event => {
+    // A port that comes with the message is a node MessagePort to the 'workerMessage' listener: its on() and once() come with node:worker_threads.
+    if (event.ports.length !== 0) require("node:worker_threads");
+    handleMessageFromMainThread(event.data);
+  });
+}
 
 async function postMessageToThread(threadId, value, transferList, timeout) {
   if (typeof transferList === "number" && typeof timeout === "undefined") {
