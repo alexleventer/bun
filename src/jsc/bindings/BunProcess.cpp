@@ -5179,35 +5179,31 @@ JSC_DEFINE_CUSTOM_GETTER(processConnectedInWorker, (JSC::JSGlobalObject * global
     return throwUnsupportedInWorker(globalObject, "connected"_s, ""_s);
 }
 
-// A slot on the `process` of a node:worker_threads worker until its first read, which builds the stream over the parent's port (node's lazyWorkerStdio).
-static JSC::EncodedJSValue nodeWorkerStdio(JSGlobalObject* lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName propertyName, unsigned fd)
+// `process.stdin` / `stdout` / `stderr` of a node:worker_threads worker. The first read builds the stream over the parent's port (node's lazyWorkerStdio). The slot stays a getter, so a read never changes the structure of `process`.
+static JSC::EncodedJSValue nodeWorkerStdio(JSGlobalObject* lexicalGlobalObject, JSC::EncodedJSValue thisValue, unsigned fd)
 {
-    auto& vm = JSC::getVM(lexicalGlobalObject);
-    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto scope = DECLARE_THROW_SCOPE(JSC::getVM(lexicalGlobalObject));
     auto* process = dynamicDowncast<Process>(JSValue::decode(thisValue));
     auto* globalObject = process ? defaultGlobalObject(process->globalObject()) : nullptr;
     auto* nodeWorker = globalObject ? globalObject->nodeWorkerState() : nullptr;
     if (!nodeWorker) [[unlikely]]
         return JSValue::encode(jsUndefined());
-    JSValue stream = nodeWorker->stdioStream(*globalObject, fd);
-    RETURN_IF_EXCEPTION(scope, {});
-    process->putDirect(vm, propertyName, stream, 0);
-    return JSValue::encode(stream);
+    RELEASE_AND_RETURN(scope, JSValue::encode(nodeWorker->stdioStream(*globalObject, fd)));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(nodeWorkerStdin, (JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, PropertyName propertyName))
+JSC_DEFINE_CUSTOM_GETTER(nodeWorkerStdin, (JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, PropertyName))
 {
-    return nodeWorkerStdio(globalObject, thisValue, propertyName, 0);
+    return nodeWorkerStdio(globalObject, thisValue, 0);
 }
 
-JSC_DEFINE_CUSTOM_GETTER(nodeWorkerStdout, (JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, PropertyName propertyName))
+JSC_DEFINE_CUSTOM_GETTER(nodeWorkerStdout, (JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, PropertyName))
 {
-    return nodeWorkerStdio(globalObject, thisValue, propertyName, 1);
+    return nodeWorkerStdio(globalObject, thisValue, 1);
 }
 
-JSC_DEFINE_CUSTOM_GETTER(nodeWorkerStderr, (JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, PropertyName propertyName))
+JSC_DEFINE_CUSTOM_GETTER(nodeWorkerStderr, (JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, PropertyName))
 {
-    return nodeWorkerStdio(globalObject, thisValue, propertyName, 2);
+    return nodeWorkerStdio(globalObject, thisValue, 2);
 }
 
 // The `process` of a node:worker_threads worker as Node's worker bootstrap leaves it before user code. Installed with the object, so the worker runs no script for it.

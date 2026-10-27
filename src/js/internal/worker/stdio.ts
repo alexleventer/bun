@@ -15,7 +15,7 @@ type PortReadable = import("node:stream").Readable & { endFromOwner?(): void };
 
 // Readable fed by a MessagePort (worker.stdout/stderr on the parent, process.stdin
 // in the worker). The peer posts arrays of Buffers; null signals EOF.
-function makePortReadable(port: MessagePort, incrementsPortRef: boolean) {
+function makePortReadable(port: MessagePort, incrementsPortRef: boolean, highWaterMark?: number) {
   let ended = false;
   let startedReading = false;
   function onMessage(event: { data: Uint8Array[] | null }) {
@@ -36,6 +36,7 @@ function makePortReadable(port: MessagePort, incrementsPortRef: boolean) {
   const stream: PortReadable = new Readable({
     // A worker builds its streams after user code ran: the options are not taken from Object.prototype.
     __proto__: null,
+    highWaterMark,
     read() {
       if (startedReading === false && incrementsPortRef) {
         startedReading = true;
@@ -74,7 +75,7 @@ function makePortReadable(port: MessagePort, incrementsPortRef: boolean) {
 
 // Writable that forwards chunks over a MessagePort (worker.stdin on the parent,
 // process.stdout/stderr in the worker). final() posts null as EOF.
-function makePortWritable(port: MessagePort) {
+function makePortWritable(port: MessagePort, highWaterMark?: number) {
   const Writable = require("internal/streams/writable");
   // Reader-side acks complete the in-flight writev. The listener refs the
   // event loop; release that immediately — the port is re-ref'd only while a
@@ -91,6 +92,7 @@ function makePortWritable(port: MessagePort) {
   }
   const stream = new Writable({
     __proto__: null,
+    highWaterMark,
     decodeStrings: false,
     writev(chunks, cb) {
       const payload = new Array(chunks.length);
@@ -149,14 +151,29 @@ function makeConsoleWriter(stream: import("node:stream").Writable) {
 }
 
 // A node worker's process.stdin without { stdin: true }.
-function makeEndedReadable() {
+function makeEndedReadable(highWaterMark: number) {
   const Readable = require("internal/streams/readable");
   return new Readable({
     __proto__: null,
+    highWaterMark,
     read() {
       this.push(null);
     },
   });
+}
+
+// process.stdin (0), stdout (1) or stderr (2) of a worker. node builds them before the worker's entry point. Built on first use here, they still get the two construction-time defaults of a stream as they were at worker start.
+function makeWorkerProcessStream(fd: number, port: MessagePort | undefined) {
+  const EventEmitter = require("node:events");
+  const highWaterMark = require("internal/streams/state").initialHighWaterMarkBytes;
+  const captureRejections = EventEmitter.captureRejections;
+  if (captureRejections) EventEmitter.captureRejections = false;
+  try {
+    if (fd === 0) return port ? makePortReadable(port, true, highWaterMark) : makeEndedReadable(highWaterMark);
+    return makePortWritable(port!, highWaterMark);
+  } finally {
+    if (captureRejections) EventEmitter.captureRejections = true;
+  }
 }
 
 export default {
@@ -164,5 +181,5 @@ export default {
   makeConsoleWriter,
   makePortReadable,
   makePortWritable,
-  makeEndedReadable,
+  makeWorkerProcessStream,
 };

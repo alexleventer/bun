@@ -3793,6 +3793,69 @@ describe("node worker start sequence", () => {
     },
   );
 
+  // The read at the limit builds the stream or throws a RangeError. Either way the next read has a working stream.
+  test("a first read of a stdio stream at the stack limit leaves it usable", async () => {
+    const result = await runWorker(`
+      function atStackLimit(name) {
+        try {
+          return atStackLimit(name);
+        } catch {
+          try {
+            return typeof process[name];
+          } catch (error) {
+            return error.name;
+          }
+        }
+      }
+      for (const name of ["stdin", "stdout", "stderr"]) {
+        const seen = atStackLimit(name);
+        if (seen !== "object" && seen !== "RangeError") throw new Error(name + ": " + seen);
+      }
+      process.stderr.write("stderr\\n");
+      process.stdin.on("data", () => {}).on("end", () => process.stdout.write("stdin end\\n"));
+    `);
+    expect(result).toEqual({ stdout: "stdin end\n", stderr: "stderr\n", exitCode: 0 });
+  });
+
+  // Node builds the streams before the entry point, so the entry point cannot change what they are built with.
+  test.each([
+    ["", {}],
+    [" with { stdin: true }", { stdin: true }],
+  ])("the stdio streams have the construction defaults of worker start%s", async (_label, options) => {
+    const result = await runWorker(
+      `
+      const stream = require("node:stream");
+      const events = require("node:events");
+      const initial = stream.getDefaultHighWaterMark(false);
+      stream.setDefaultHighWaterMark(false, 1234);
+      events.captureRejections = true;
+      const streams = [process.stdin, process.stdout, process.stderr];
+      // emit() takes the promise that a listener returns only when the emitter captures rejections.
+      let taken = 0;
+      const listener = () => {
+        const promise = Promise.resolve();
+        promise.then = function (...args) {
+          taken++;
+          return Promise.prototype.then.apply(this, args);
+        };
+        return promise;
+      };
+      for (const emitter of [...streams, new events.EventEmitter()]) emitter.on("probe", listener).emit("probe");
+      process.stdout.write(JSON.stringify({
+        highWaterMark: [streams[0].readableHighWaterMark, streams[1].writableHighWaterMark, streams[2].writableHighWaterMark].map(value => value === initial),
+        defaults: [stream.getDefaultHighWaterMark(false), events.captureRejections],
+        taken,
+      }));
+    `,
+      options,
+    );
+    expect(result).toEqual({
+      stdout: JSON.stringify({ highWaterMark: [true, true, true], defaults: [1234, true], taken: 1 }),
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
   describe("a synchronous exit", () => {
     test("writes what waits for the parent ahead of the 'exit' listeners", async () => {
       const result = await runWorker(`
