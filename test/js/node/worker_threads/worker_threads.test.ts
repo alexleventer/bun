@@ -3598,6 +3598,36 @@ describe("node worker start sequence", () => {
     expect(exitCode).toBe(0);
   });
 
+  // `process` is made on its first use, which can be inside user code. The computed key keeps that use out of the entry point's own code block.
+  test("making the process object reads nothing that user code can intercept", async () => {
+    const entry = `
+      let calls = 0;
+      const key = "pro" + "cess";
+      Object.defineProperty(Object.prototype, "NODE_CHANNEL_FD", {
+        configurable: true,
+        get() {
+          calls++;
+          return typeof globalThis[key];
+        },
+      });
+      const made = globalThis[key];
+      delete Object.prototype.NODE_CHANNEL_FD;
+      made.stdout.write(JSON.stringify({ calls, send: typeof made.send }));
+    `;
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `new (require("node:worker_threads").Worker)(${JSON.stringify(entry)}, { eval: true, env: { inherited: "no" } });`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: `{"calls":0,"send":"undefined"}`, stderr: "", exitCode: 0 });
+  });
+
   // Node has one 'exit' listener there (flushSync). Bun flushes natively.
   test("process has no 'exit' listener of its own, and require('node:console') is the global console", async () => {
     const result = await runWorker(`

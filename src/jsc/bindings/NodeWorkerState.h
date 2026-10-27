@@ -34,6 +34,9 @@ public:
 
     WebCore::MessagePort* port(NodePort which) const { return m_ports[which].get(); }
     JSC::JSValue workerData() const { return m_workerData.get(); }
+    // Whether the worker's env had a NODE_CHANNEL_FD when the worker started. Node then disables the IPC surface of `process`.
+    bool envNamesIpcChannel() const { return m_envNamesIpcChannel; }
+    void setEnvNamesIpcChannel(bool value) { m_envNamesIpcChannel = value; }
 
     // process.stdin (0), stdout (1) or stderr (2). A build that throws is not remembered: the next call builds again.
     JSC::JSValue stdioStream(Zig::GlobalObject&, unsigned fd);
@@ -65,6 +68,7 @@ private:
     std::array<ConsoleQueue, 2> m_consoleQueues;
     bool m_entrySettled { false };
     bool m_isExiting { false };
+    bool m_envNamesIpcChannel { false };
 
     JSC::WriteBarrier<JSC::Unknown> m_workerData;
     std::array<JSC::WriteBarrier<JSC::JSObject>, 3> m_stdioStreams;

@@ -651,10 +651,13 @@ extern "C" JSC::JSGlobalObject* Zig__GlobalObject__create(void* console_client, 
         const auto initializeWorker = [&](WebCore::WorkerMessagingProxy& worker) -> void {
             auto& options = worker.options();
 
+            // What `process.env.NODE_CHANNEL_FD` is when this worker starts. An env that the worker inherits has none: the env loader takes none from the process's environment (is_ipc_channel_key).
+            bool envNamesIpcChannel = false;
             if (options.env.has_value()) {
                 auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
                 HashMap<String, String> map = *std::exchange(options.env, std::nullopt);
                 auto size = map.size();
+                envNamesIpcChannel = !map.get(String("NODE_CHANNEL_FD"_s)).isEmpty();
 
                 // In theory, a GC could happen before we finish putting all the properties on the object.
                 // So we use a MarkedArgumentBuffer to ensure that the strings are not collected and we immediately put them on the object.
@@ -690,9 +693,12 @@ extern "C" JSC::JSGlobalObject* Zig__GlobalObject__create(void* console_client, 
                 // resolved. Consumed like options.env, and published on the context
                 // before the view, which resolves its store through the context.
                 RefPtr<Bun::SharedEnvStore> store = std::exchange(options.sharedEnvStore, nullptr);
+                envNamesIpcChannel = !store->get("NODE_CHANNEL_FD"_s).isEmpty();
                 globalObject->scriptExecutionContext()->setSharedEnvStore(*store);
                 globalObject->m_processEnvObject.set(vm, globalObject, Bun::createSharedEnvironmentVariablesMap(globalObject).getObject());
             }
+            if (auto* nodeWorker = globalObject->nodeWorkerState())
+                nodeWorker->setEnvNamesIpcChannel(envNamesIpcChannel);
 
             // Ensure that the TerminationException singleton is constructed. Workers need this so
             // that we can request their termination from another thread. For the main thread, we

@@ -5238,15 +5238,8 @@ static void installNodeWorkerProcessSurface(JSC::VM& vm, Process* process)
     disable("initgroups"_s);
 #endif
 
-    // Node disables the IPC surface only in a worker whose env names a channel. The env loader takes no NODE_CHANNEL_FD from the process's environment (is_ipc_channel_key), so only an env that `new Worker` copied or shares can have one.
-    JSObject* env = globalObject->m_processEnvObject.get();
-    if (!env)
-        return;
-    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-    JSValue channel = env->get(globalObject, Identifier::fromString(vm, "NODE_CHANNEL_FD"_s));
-    bool envNamesChannel = !scope.exception() && channel.toBoolean(globalObject);
-    CLEAR_IF_EXCEPTION(scope);
-    if (!envNamesChannel)
+    // Node disables the IPC surface only in a worker whose env names a channel. Decided when the worker started: this runs on the first use of `process`, which can be inside user code.
+    if (!globalObject->nodeWorkerState()->envNamesIpcChannel())
         return;
     disable("send"_s);
     disable("disconnect"_s);
