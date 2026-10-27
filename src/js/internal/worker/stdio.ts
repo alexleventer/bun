@@ -80,7 +80,11 @@ function makePortWritable(port: MessagePort) {
 type WriteCallback = (error?: Error | null) => void;
 
 // [the Writable, what completes its batch in flight without the reader's ack]. `awaitsConsoleAck`: the worker's console posted a batch over this port that the reader has yet to ack.
-function makeWritable(port: MessagePort, highWaterMark: number | undefined, awaitsConsoleAck: boolean) {
+function makeWritable(
+  port: MessagePort,
+  highWaterMark: number | undefined,
+  awaitsConsoleAck: boolean,
+): [import("node:stream").Writable, () => void] {
   const Writable = require("internal/streams/writable");
   // Reader-side acks complete the in-flight writev.
   let pendingWriteCallback: WriteCallback | null = null;
