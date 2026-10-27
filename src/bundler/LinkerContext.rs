@@ -4012,27 +4012,48 @@ impl<'a> LinkerContext<'a> {
                         }
                     }
 
-                    // Warn about importing from a file that is known to not have any exports
-                    if status == ImportTrackerStatus::CjsWithoutExports
+                    // Warn about importing from a file that is known to not have any exports.
+                    // The default import of a disabled module is its `{}` exports object.
+                    let is_disabled_named_import = status == ImportTrackerStatus::Disabled
+                        && !named_import.alias_is_star
+                        && named_import.alias.is_some_and(|a| a.slice() != b"default");
+                    if (status == ImportTrackerStatus::CjsWithoutExports || is_disabled_named_import)
                         && !self.is_call_record(prev_source_index, named_import.import_record_index)
                     {
+                        if is_disabled_named_import {
+                            // Printed as `undefined`, so the empty module is not needed for it.
+                            // SAFETY: the symbol slot is disjoint from `named_import` (`graph.ast`).
+                            unsafe { self.graph.symbol_mut(tracker.import_ref) }.import_item_status =
+                                ImportItemStatus::Missing;
+                        }
                         let source = self.get_source(tracker.source_index.get());
+                        let imported = self.get_source(next_tracker.source_index.get());
                         // SAFETY: `alias` is an arena `*const [u8]` valid for the link pass.
                         let alias = named_import
                             .alias
                             .expect("infallible: alias present")
                             .slice();
+                        let message = format_args!(
+                            "Import \"{}\" will always be undefined because the file \"{}\" has no exports",
+                            bstr::BStr::new(alias),
+                            bstr::BStr::new(&imported.path.pretty),
+                        );
                         // Split-borrow with `named_import` (`&self.graph`) —
                         // `log_disjoint` returns the disjoint `Transpiler.log` backref.
-                        self.log_disjoint().add_range_warning_fmt(
-                            Some(source),
-                            source.range_of_identifier(named_import.alias_loc),
-                            format_args!(
-                                "Import \"{}\" will always be undefined because the file \"{}\" has no exports",
-                                bstr::BStr::new(alias),
-                                bstr::BStr::new(&source.path.pretty),
-                            ),
-                        );
+                        // Like esbuild, an import inside node_modules is not the user's to fix.
+                        if is_disabled_named_import && source.path.is_node_module() {
+                            self.log_disjoint().add_debug_fmt(
+                                Some(source),
+                                named_import.alias_loc,
+                                message,
+                            );
+                        } else {
+                            self.log_disjoint().add_range_warning_fmt(
+                                Some(source),
+                                source.range_of_identifier(named_import.alias_loc),
+                                message,
+                            );
+                        }
                     }
                 }
 
