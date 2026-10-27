@@ -781,7 +781,8 @@ function withPledgedSrcSize(buffer, opts) {
     // Leave invalid input to the existing validation.
     return opts;
   }
-  return { __proto__: null, ...opts, pledgedSrcSize };
+  // A plain copy: the `__proto__: null` of Node's copy costs a host call for each call.
+  return { ...opts, pledgedSrcSize };
 }
 
 const kMaxBrotliParam = 9;
