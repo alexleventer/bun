@@ -1254,11 +1254,10 @@ fn write_trace_with_colors(
     global: &JSGlobalObject,
     enable_colors: bool,
 ) {
+    let mut source_code = bun_core::Utf8Bytes::EMPTY;
     let mut holder = crate::zig_exception::Holder::init();
     // SAFETY: per-thread VM; `console.trace()` only runs on the JS thread.
     let vm = VirtualMachine::get().as_mut();
-
-    let mut source_code_slice: Option<bun_core::Utf8Bytes> = None;
 
     let err = global.create_error_instance(format_args!("trace output"));
     // `remap_zig_exception` populates `holder.zig_exception()` from `err`.
@@ -1271,7 +1270,7 @@ fn write_trace_with_colors(
         err,
         None,
         &mut need_to_clear,
-        &mut source_code_slice,
+        &mut source_code,
         false,
     );
     holder.need_to_clear_parser_arena_on_deinit = need_to_clear;
@@ -1283,7 +1282,6 @@ fn write_trace_with_colors(
         enable_colors,
     );
 
-    drop(source_code_slice);
     holder.deinit(vm);
 }
 
