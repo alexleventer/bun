@@ -25,6 +25,7 @@ unsafe extern "C" {
     safe fn JSC__VM__getAPILock(vm: &VM);
     safe fn JSC__VM__releaseAPILock(vm: &VM);
     safe fn JSC__VM__reportExtraMemory(vm: &VM, size: usize);
+    safe fn JSC__VM__reportExtraMemoryAllocated(vm: &VM, owner: JSValue, size: usize);
     safe fn JSC__VM__shrinkFootprint(vm: &VM);
     safe fn JSC__VM__runGC(vm: &VM, sync: bool) -> usize;
     safe fn JSC__VM__heapSize(vm: &VM) -> usize;
@@ -83,6 +84,11 @@ impl VM {
     #[inline]
     pub fn deprecated_report_extra_memory(&self, size: usize) {
         self.report_extra_memory(size);
+    }
+
+    /// `Heap::reportExtraMemoryAllocated`: `owner`, whose `estimatedSize` counts them, has `size` new bytes. Can collect.
+    pub fn report_extra_memory_allocated(&self, owner: JSValue, size: usize) {
+        JSC__VM__reportExtraMemoryAllocated(self, owner, size)
     }
 
     pub fn shrink_footprint(&self) {
