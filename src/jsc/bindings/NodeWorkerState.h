@@ -61,15 +61,29 @@ public:
 private:
     // The flow control of internal/worker/stdio: one batch is in flight, and what is written meanwhile waits for the reader's ack.
     struct ConsoleQueue {
-        // What waits, and where the output of each console call ends in it: the reader gets one chunk for each call.
+        // The output of the console calls that the reader has yet to ack: of the batch in flight (the first `inFlight` calls), then of what waits behind it. `ends[i]` is where the output of call `i` ends: the reader gets one chunk for each call.
         Vector<uint8_t> bytes;
         Vector<size_t> ends;
-        bool isAwaitingAck { false };
+        size_t inFlight { 0 };
+
+        std::span<const uint8_t> output(size_t call) const
+        {
+            size_t begin = call ? ends[call - 1] : 0;
+            return bytes.subspan(begin, ends[call] - begin);
+        }
+        void clear()
+        {
+            bytes.clear();
+            ends.clear();
+            inFlight = 0;
+        }
     };
 
     void stopListening(NodePort);
-    // Whether the batch is with the port. Leaves no exception pending.
-    bool postConsoleOutput(Zig::GlobalObject&, unsigned fd, std::span<const uint8_t> bytes, std::span<const size_t> ends);
+    // The output of the calls from `first` up to `end`, as an array with a Uint8Array for each. Null with an exception pending.
+    JSC::JSArray* consoleChunks(Zig::GlobalObject&, const ConsoleQueue&, size_t first, size_t end);
+    // Posts what the queue holds from call `first` on. Whether the batch is with the port. Leaves no exception pending.
+    bool postConsoleOutput(Zig::GlobalObject&, unsigned fd, size_t first);
     // Posts what waits for an ack without one, and stops waiting.
     void releaseConsoleQueue(Zig::GlobalObject&, unsigned fd);
     void writeConsoleToStream(Zig::GlobalObject&, JSC::JSObject* write, std::span<const uint8_t>);

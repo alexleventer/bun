@@ -16,6 +16,8 @@ type PortReadable = import("node:stream").Readable & { endFromOwner?(): void };
 function makePortReadable(port: MessagePort, incrementsPortRef: boolean, highWaterMark?: number) {
   let ended = false;
   let startedReading = false;
+  // The writer takes a request for more data for the ack of its batch in flight, so none goes out ahead of the first batch.
+  let received = false;
   function onMessage(event: { data: Uint8Array[] | null }) {
     const payload = event.data;
     if (payload === null) {
@@ -25,6 +27,7 @@ function makePortReadable(port: MessagePort, incrementsPortRef: boolean, highWat
       }
       port.removeEventListener("message", onMessage);
     } else if (ended === false) {
+      received = true;
       for (let i = 0; i < payload.length; i++) {
         stream.push(Buffer.from(payload[i]));
       }
@@ -42,7 +45,7 @@ function makePortReadable(port: MessagePort, incrementsPortRef: boolean, highWat
       }
       // Tell the writer we want more data; it completes its in-flight writev
       // on receipt (node's STDIO_WANTS_MORE_DATA).
-      if (ended === false) port.postMessage(true);
+      if (ended === false && received) port.postMessage(true);
     },
   });
   // Attach eagerly so the peer's writev is ack'd (via push -> maybeReadMore ->
@@ -74,45 +77,21 @@ function makePortReadable(port: MessagePort, incrementsPortRef: boolean, highWat
 // Writable that forwards chunks over a MessagePort (worker.stdin on the parent,
 // process.stdout/stderr in the worker). final() posts null as EOF.
 function makePortWritable(port: MessagePort) {
-  return makeWritable(port, undefined, false)[0];
+  return makeWritable(port, undefined, undefined)[0];
 }
 
-type WriteCallback = (error?: Error | null) => void;
-
-// [the Writable, what completes its batch in flight without the reader's ack]. `awaitsConsoleAck`: the worker's console posted a batch over this port that the reader has yet to ack.
+// [the Writable, what completes its batch in flight without the reader's ack]. `inFlight`: a batch that the worker's console posted over this port and the reader has yet to ack, as one chunk for each console call.
 function makeWritable(
   port: MessagePort,
   highWaterMark: number | undefined,
-  awaitsConsoleAck: boolean,
+  inFlight: Uint8Array[] | undefined,
 ): [import("node:stream").Writable, () => void] {
   const Writable = require("internal/streams/writable");
   // Reader-side acks complete the in-flight writev.
-  let pendingWriteCallback: WriteCallback | null = null;
-  // A writev that waits for the ack of the console's batch, so that one batch is in flight.
-  let parked: [Uint8Array[], WriteCallback] | null = null;
-  function post(payload: Uint8Array[], cb: WriteCallback) {
-    port.postMessage(payload);
-    if (process._exiting) {
-      // No event loop turns remain to deliver an ack; complete synchronously so exit-time writes are not lost (node does the same).
-      cb();
-    } else {
-      // Only one writev is in flight at a time, so the slot can't be occupied.
-      pendingWriteCallback = cb;
-      port.ref();
-    }
-  }
+  let pendingWriteCallback: ((error?: Error | null) => void) | null = null;
+  // The first writev is `inFlight` again: the console posted it, and holds the port's loop ref for it.
+  let adoptsConsoleBatch = inFlight !== undefined;
   function onAck() {
-    if (awaitsConsoleAck) {
-      // The loop ref that the console held for its batch goes with the wait.
-      awaitsConsoleAck = false;
-      port.unref();
-      const waiting = parked;
-      if (waiting !== null) {
-        parked = null;
-        post(waiting[0], waiting[1]);
-      }
-      return;
-    }
     const cb = pendingWriteCallback;
     if (cb !== null) {
       pendingWriteCallback = null;
@@ -125,13 +104,26 @@ function makeWritable(
     highWaterMark,
     decodeStrings: false,
     writev(chunks, cb) {
+      if (adoptsConsoleBatch) {
+        adoptsConsoleBatch = false;
+        pendingWriteCallback = cb;
+        return;
+      }
       const payload = new Array(chunks.length);
       for (let i = 0; i < chunks.length; i++) {
         const { chunk, encoding } = chunks[i];
         payload[i] = typeof chunk === "string" ? Buffer.from(chunk, encoding) : chunk;
       }
-      if (awaitsConsoleAck && !process._exiting) parked = [payload, cb];
-      else post(payload, cb);
+      port.postMessage(payload);
+      if (process._exiting) {
+        // No event loop turns remain to deliver an ack; complete synchronously
+        // so exit-time writes are not lost (node does the same).
+        cb();
+      } else {
+        // Only one writev is in flight at a time, so the slot can't be occupied.
+        pendingWriteCallback = cb;
+        port.ref();
+      }
     },
     final(cb) {
       port.postMessage(null);
@@ -148,23 +140,20 @@ function makeWritable(
         port.unref();
         pending(err);
       }
-      const waiting = parked;
-      if (waiting !== null) {
-        parked = null;
-        waiting[1](err);
-      }
-      if (awaitsConsoleAck) {
-        awaitsConsoleAck = false;
-        port.unref();
-      }
       port.removeEventListener("message", onAck);
       cb(err);
     },
   } as import("node:stream").WritableOptions);
   // Last: a constructor that threw must leave nothing on the port.
   port.addEventListener("message", onAck);
-  // The listener refs the event loop. That is released unless a batch is in flight: unflushed data keeps the writer alive (node's kWaitingStreams), and an idle stream never pins the loop.
-  if (!awaitsConsoleAck) port.unref();
+  if (inFlight === undefined) {
+    // The listener refs the event loop. That is released while no batch is in flight: unflushed data keeps the writer alive (node's kWaitingStreams), and an idle stream never pins the loop.
+    port.unref();
+  } else {
+    stream.cork();
+    for (let i = 0; i < inFlight.length; i++) stream.write(inFlight[i]);
+    stream.uncork();
+  }
   // On a synchronous exit no ack can arrive. onAck then lets the Writable clear its buffer through writev, which completes synchronously because process._exiting is set (node's flushSync).
   return [stream, onAck];
 }
@@ -193,14 +182,14 @@ function makeEndedReadable(highWaterMark: number) {
 }
 
 // process.stdin (0) of a worker, or for stdout (1) and stderr (2): [the stream, what completes its batch in flight at a synchronous exit, what the console writes to it with]. node builds them before the worker's entry point. Built on first use here, they still get the two construction-time defaults of a stream as they were at worker start.
-function makeWorkerProcessStream(fd: number, port: MessagePort | undefined, awaitsConsoleAck: boolean) {
+function makeWorkerProcessStream(fd: number, port: MessagePort | undefined, inFlight: Uint8Array[] | undefined) {
   const EventEmitter = require("node:events");
   const highWaterMark = require("internal/streams/state").initialHighWaterMarkBytes;
   const captureRejections = EventEmitter.captureRejections;
   if (captureRejections) EventEmitter.captureRejections = false;
   try {
     if (fd === 0) return port ? makePortReadable(port, true, highWaterMark) : makeEndedReadable(highWaterMark);
-    const built = makeWritable(port!, highWaterMark, awaitsConsoleAck);
+    const built = makeWritable(port!, highWaterMark, inFlight);
     return [built[0], built[1], makeConsoleWriter(built[0])];
   } finally {
     if (captureRejections) EventEmitter.captureRejections = true;

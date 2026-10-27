@@ -420,23 +420,15 @@ fn message_with_type_and_level_(
         return Ok(());
     }
 
+    // SAFETY: see [`vm_console`]; a read of a `Copy` field, no reference is kept.
+    if let ConsoleOutput::WorkerStdio { colors } = unsafe { (*console).output } {
+        return message_to_worker_stdio(console, message_type, level, global, vals, len, colors);
+    }
+
     // Lock/unlock a mutex incase two JS threads are console.log'ing at the same
     // time. We do this the slightly annoying way to avoid assigning a pointer.
     let use_stderr = matches!(level, MessageLevel::Warning | MessageLevel::Error)
         || message_type == MessageType::Assert;
-    // SAFETY: see [`vm_console`]; a read of a `Copy` field, no reference is kept.
-    if let ConsoleOutput::WorkerStdio { colors } = unsafe { (*console).output } {
-        return message_to_worker_stdio(
-            console,
-            message_type,
-            level,
-            global,
-            vals,
-            len,
-            use_stderr,
-            colors,
-        );
-    }
     let _stream_lock = ConsoleStreamLock::acquire(use_stderr);
 
     if message_type == MessageType::Clear {
@@ -527,12 +519,13 @@ fn message_to_worker_stdio(
     global: &JSGlobalObject,
     vals: *const JSValue,
     len: usize,
-    use_stderr: bool,
     colors: bool,
 ) -> JsResult<()> {
     if message_type == MessageType::Clear {
         return Ok(());
     }
+    let use_stderr = matches!(level, MessageLevel::Warning | MessageLevel::Error)
+        || message_type == MessageType::Assert;
     // SAFETY: see [`vm_console`]; not mutated again until the caller's `_indent_guard` runs.
     let default_indent = unsafe { (*console).default_indent };
     let mut buffer: Vec<u8> = Vec::new();

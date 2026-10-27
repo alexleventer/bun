@@ -4062,20 +4062,24 @@ describe("node worker start sequence", () => {
       });
     });
 
-    // A 'readable' listener makes the parent's reader ask once, ahead of any output. That is no ack of what the worker writes later.
-    test("when the parent's reader asked before the worker wrote", async () => {
+    // A 'readable' listener makes the parent's reader look for data ahead of any output. The worker must not take that for the ack of what it writes.
+    test.each([
+      ["after its entry point", false],
+      ["in its entry point", true],
+    ])("when the parent's reader looked for data before the worker wrote %s", async (_label, inEntryPoint) => {
       const worker = new Worker(
         `const { parentPort } = require("node:worker_threads");
          let wrote = false, drained = false;
-         parentPort.on("message", message => {
-           if (message === "state") return ${report};
+         function write() {
            process.stdout.write(Buffer.alloc(${megabyte}, 0x61), () => { wrote = true; });
            process.stdout.once("drain", () => { drained = true; });
-         });`,
+         }
+         parentPort.on("message", message => (message === "state" ? ${report} : write()));
+         if (${inEntryPoint}) write();`,
         { eval: true, stdout: true },
       );
       worker.stdout.on("readable", () => {});
-      worker.postMessage("write");
+      if (!inEntryPoint) worker.postMessage("write");
       expect(await stateWithUnread(worker, megabyte)).toEqual({ wrote: false, drained: false, waiting: true });
     });
   });
