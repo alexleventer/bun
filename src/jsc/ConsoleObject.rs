@@ -518,7 +518,7 @@ fn message_with_type_and_level_(
     )
 }
 
-/// The console of a `node:worker_threads` worker: one message, formatted into a buffer and handed to the worker's stdout / stderr channel.
+/// The console of a `node:worker_threads` worker: one message, formatted into a buffer and handed to the worker's stdout / stderr channel. Nothing is printed on this thread, so the test runner's before-print hook is not for here.
 #[inline(never)]
 fn message_to_worker_stdio(
     console: *mut ConsoleObject,
@@ -541,9 +541,6 @@ fn message_to_worker_stdio(
     } else if len == 0 && message_type == MessageType::Log {
         buffer.push(b'\n');
     } else {
-        if let Some(hooks) = crate::virtual_machine::runtime_hooks() {
-            (hooks.console_on_before_print)();
-        }
         // SAFETY: caller (JSC C++) guarantees `vals` points to `len` JSValues.
         let vals = unsafe { bun_core::ffi::slice(vals, len) };
         write_message(

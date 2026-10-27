@@ -215,7 +215,8 @@ JSValue NodeWorkerState::stdioStream(Zig::GlobalObject& globalObject, unsigned f
     args.append(jsNumber(fd));
     args.append(port ? toJS(&globalObject, &globalObject, *port) : jsUndefined());
     // The stream starts with the console's batch in flight: its first writev waits for that ack.
-    args.append(jsBoolean(queue && queue->isAwaitingAck));
+    bool awaitsConsoleAck = queue && queue->isAwaitingAck;
+    args.append(jsBoolean(awaitsConsoleAck));
     JSValue result = JSC::profiledCall(&globalObject, ProfilingReason::API, build, JSC::getCallData(build), globalObject.globalThis(), args);
     RETURN_IF_EXCEPTION(scope, {});
 
@@ -235,9 +236,10 @@ JSValue NodeWorkerState::stdioStream(Zig::GlobalObject& globalObject, unsigned f
     JSObject* write = built->getIndexQuickly(2).getObject();
     RELEASE_ASSERT(stream && flush && flush->isCallable() && write && write->isCallable());
 
-    // The stream has the port from here on, and with it the ack that the console waited for and the loop ref held for that.
+    // The stream has the port from here on, and with it the ack that the console waited for and the loop ref held for that. A batch that a console call posted from inside the build is not the stream's: its loop ref goes here.
     stopListening(static_cast<NodePort>(fd));
-    queue->isAwaitingAck = false;
+    if (std::exchange(queue->isAwaitingAck, false) && !awaitsConsoleAck)
+        port->jsUnref(&globalObject);
     m_stdioStreams[fd].set(vm, &globalObject, stream);
     m_stdioFlush[fd - 1].set(vm, &globalObject, flush);
     m_consoleWrite[fd - 1].set(vm, &globalObject, write);

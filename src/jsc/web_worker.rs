@@ -887,7 +887,7 @@ impl WebWorker {
             }
         };
 
-        // On every post-evaluation path: what postMessageToThread() sent to a node worker meanwhile is delivered here, so its sender's Atomics.waitAsync settles even when the entry failed.
+        // On every post-evaluation path: what postMessageToThread() sent to a node worker meanwhile is delivered here while script may still run, so its sender's Atomics.waitAsync settles also when the entry threw.
         WebWorker__entrySettled(vm.global());
         // That delivery runs JS, which can request termination. If it did, stop before the start sequence's GC.
         if self.has_requested_terminate() {
