@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { cssInternals } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe } from "harness";
 import { join } from "path";
@@ -7345,6 +7344,33 @@ describe("css tests", () => {
         }`,
         safari(8),
       );
+      // A property with several vendor prefixes is one entry of the list and one name per prefix.
+      prefix_test(
+        `.foo { transition-property: mask-border, mask-image; transition-duration: 1s, 2s }`,
+        `.foo {
+          transition-property: -webkit-mask-box-image, mask-border, -webkit-mask-image, mask-image;
+          transition-duration: 1s, 1s, 2s, 2s;
+        }`,
+        safari(15),
+      );
+      prefix_test(
+        `.foo { transition-property: mask-size, inset, opacity; transition-duration: 1s, 2s, 3s }`,
+        `.foo {
+          transition-property: -webkit-mask-size, mask-size, top, bottom, left, right, opacity;
+          transition-duration: 1s, 1s, 2s, 2s, 2s, 2s, 3s;
+        }`,
+        safari(8),
+      );
+      prefix_test(
+        `.foo { transition-property: inset, transform, opacity; transition-duration: 1s, 2s, 3s }`,
+        `.foo {
+          -webkit-transition-property: top, bottom, left, right, -webkit-transform, transform, opacity;
+          transition-property: top, bottom, left, right, -webkit-transform, transform, opacity;
+          -webkit-transition-duration: 1s, 1s, 1s, 1s, 2s, 2s, 3s;
+          transition-duration: 1s, 1s, 1s, 1s, 2s, 2s, 3s;
+        }`,
+        safari(6),
+      );
       prefix_test(
         `.foo { transition-property: margin-inline-start, inset, opacity; transition-duration: 1s, 2s, 3s }`,
         `.foo { transition-duration: 1s, 2s, 2s, 2s, 2s, 3s; }
@@ -7361,16 +7387,13 @@ describe("css tests", () => {
         `.foo { transition: top 1s, bottom 1s, left 1s, right 1s, opacity 2s; }`,
         safari(8),
       );
-      test("a merged block keeps the pairs when the second pass adds `-webkit-mask-box-image` again", () => {
-        const output = cssInternals.minifyTest(
-          `.foo{transition-property:mask-border,opacity;transition-duration:1s,2s}
-           .foo{transition-delay:0s;transition-timing-function:ease}`,
-          "",
-          safari(15),
-        );
-        const transitions = output.slice(output.indexOf(":") + 1, output.indexOf("}")).split(",");
-        expect(new Set(transitions)).toEqual(new Set(["-webkit-mask-box-image 1s", "mask-border 1s", "opacity 2s"]));
-      });
+      // The second pass writes `-webkit-mask-box-image` again, as on main. It has the duration of `mask-border`.
+      prefix_test(
+        `.foo { transition-property: mask-border, opacity; transition-duration: 1s, 2s }
+         .foo { transition-delay: 0s; transition-timing-function: ease }`,
+        `.foo { transition: -webkit-mask-box-image 1s, -webkit-mask-box-image 1s, mask-border 1s, opacity 2s; }`,
+        safari(15),
+      );
 
       // Prints `color 1s, opacity 1s`: the later property list meets one duration per name of the first list.
       cssTestTodo(
@@ -7378,7 +7401,7 @@ describe("css tests", () => {
         `.foo { transition: color 1s, opacity 2s; }`,
         safari(8),
       );
-      // Prints three names beside `1s, 2s`: a property with several vendor prefixes is one entry of the list.
+      // Prints three names beside `1s, 2s`: no entry becomes several names, and `transform` is one entry of the list.
       cssTestTodo(
         `.foo { transition-property: transform, opacity; transition-duration: 1s, 2s }`,
         `.foo {
@@ -7388,6 +7411,13 @@ describe("css tests", () => {
           transition-duration: 1s, 1s, 2s;
         }`,
         safari(6),
+      );
+      // Prints `opacity 1s, top 2s`: the second pass reads `1s, 1s, 2s, 3s, 3s, 3s, 3s` with `mask-size` as one entry.
+      cssTestTodo(
+        `.foo { transition-property: mask-size, opacity, inset; transition-duration: 1s, 2s, 3s }
+         .foo { transition-delay: 0s; transition-timing-function: ease }`,
+        `.foo { transition: -webkit-mask-size 1s, mask-size 1s, opacity 2s, top 3s, bottom 3s, left 3s, right 3s; }`,
+        safari(8),
       );
 
       // Nothing becomes several names without targets, or for targets that need nothing.

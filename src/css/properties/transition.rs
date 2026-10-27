@@ -493,7 +493,8 @@ mod transition_handler_body {
         let mut transitions = SmallList::<Transition, 1>::init_capacity(1);
         for (index, property_id) in (0u32..).zip(properties.slice()) {
             // Each name takes the values of its entry as written. lightningcss matches by position, which shifts them.
-            let source = sources.map_or(index, |sources| sources[index as usize]);
+            // `sources` and `transitions` both have one element per printed name.
+            let source = sources.map_or(index, |sources| sources[transitions.len() as usize]);
             let duration = if !durations.is_empty() {
                 durations.at(source % durations.len()).deep_clone(arena)
             } else {
@@ -576,15 +577,30 @@ mod transition_handler_body {
             }
         }
 
-        // Once an entry becomes several names, each name keeps the index of its entry as written.
+        // A property with several vendor prefixes is one entry of the list and one name per prefix.
+        fn push_names(sources: &mut Vec<u32>, property_id: &PropertyId, source: u32) {
+            let names = property_id.prefix().bits().count_ones().max(1);
+            sources.resize(sources.len() + names as usize, source);
+        }
+
+        // Once an entry becomes several names, each printed name keeps the index of its entry as written.
         #[cold]
-        fn record_names(sources: &mut Option<Vec<u32>>, source: u32, names: u32, capacity: u32) {
+        fn record_names(
+            sources: &mut Option<Vec<u32>>,
+            properties: &[PropertyId],
+            names: core::ops::Range<u32>,
+            source: u32,
+        ) {
             let sources = sources.get_or_insert_with(|| {
-                let mut sources = Vec::with_capacity(capacity as usize);
-                sources.extend(0..source);
+                let mut sources = Vec::with_capacity(properties.len());
+                for (property_id, entry) in properties[..names.start as usize].iter().zip(0u32..) {
+                    push_names(&mut sources, property_id, entry);
+                }
                 sources
             });
-            sources.resize(sources.len() + names as usize, source);
+            for property_id in &properties[names.start as usize..names.end as usize] {
+                push_names(sources, property_id, source);
+            }
         }
 
         let mut rtl_properties: Option<SmallList<PropertyId, 1>> = None;
@@ -660,9 +676,8 @@ mod transition_handler_body {
                 }
             }
 
-            let names = i - start;
-            if names > 1 || sources.is_some() {
-                record_names(sources, source, names, properties.len());
+            if i - start > 1 || sources.is_some() {
+                record_names(sources, properties.slice(), start..i, source);
             }
             source += 1;
         }
